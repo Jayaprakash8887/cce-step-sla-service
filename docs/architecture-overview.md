@@ -1,0 +1,230 @@
+# Architecture & Design — Step SLA Service
+
+> The time plane: what happens because a deadline passed, not because an event arrived.
+
+System-wide context — why the services are split, the shared schema, the SLA handoff contract — lives
+in the **cce-common-util** repository's
+[Architecture Overview](../../cce-common-util/docs/architecture-overview.md). This document covers
+only what is specific to this service.
+
+---
+
+## 1. Responsibility
+
+Everything driven by **time passing**:
+
+1. Claim the `step_sla_state_transition` rows the Matcher Service scheduled, once they fall due.
+2. Write `step_instance.sla_status` — this service is its only writer.
+3. Record the resulting `OVERDUE` / `MISSED` deviations.
+4. Evaluate the intelligence actions those deviations trigger, and publish them.
+
+It also exposes a read API over `intelligence_event_log`.
+
+**What it does not do**: match inbound events, enrol patients, create or complete steps, or manage
+definitions. It has no Kafka consumer — nothing inbound reaches it. `ORDER_VIOLATION` deviations stay
+with the Matcher Service, which detects them at completion from the event itself.
+
+## 2. Owns no tables
+
+This service creates nothing. Flyway is **disabled**; `ddl-auto` is `validate`.
+
+Enabling Flyway here would add an empty ledger and invite a second service to write DDL for tables it
+does not own. Instead the service validates its JPA mapping against the schema at startup and fails
+fast if what it needs is absent — which is also how a deployment-order mistake surfaces immediately
+rather than as a runtime error hours later.
+
+Deploy **last**. Table ownership and the full ordering rationale:
+[Data Dictionary §3](../../cce-common-util/docs/data-dictionary.md#3-ownership).
+
+## 3. The claim protocol
+
+```mermaid
+flowchart TD
+    S["@Scheduled poll<br/>every cce.sla.poll-interval-ms"] --> D["claimDue(now, batchSize)<br/>deadline has passed"]
+    D --> C["claimForCompletedSteps(now, room left)<br/>step already COMPLETED"]
+    C --> E{"rows returned?"}
+    E -->|"none"| Z["cycle ends — one empty query"]
+    E -->|"some"| A["apply each row<br/>same transaction as the claim"]
+    A --> F{"batch full?"}
+    F -->|yes| D
+    F -->|"short"| Z
+    A -.->|"transaction rolled back"| B["backOff(ids)<br/>REQUIRES_NEW"]
+```
+
+Three properties make this safe without any coordination machinery:
+
+**The row lock is the claim.** `FOR UPDATE SKIP LOCKED` means a row locked by one replica is
+*invisible* to the others rather than contended, so every replica can poll the same table
+concurrently. There is no lease table, no heartbeat, and no leader election. A replica that dies
+mid-batch drops its connection, its locks release, and the work is immediately claimable again — no
+lease expiry to wait out.
+
+**Claim and apply share one transaction.** Claiming in one transaction and applying in another would
+leave a window where a row is marked taken but not yet acted on, and a crash inside that window makes
+the state permanent. Here there is no such window: either the row is applied and committed, or the
+lock is released and nothing happened.
+
+**Batches drain within a cycle.** The evaluator keeps claiming until a batch comes back short, so a
+backlog that accumulated while the service was down clears in one cycle rather than one batch per
+interval. `MAX_BATCHES_PER_CYCLE` (100) stops a pathological backlog from monopolising the thread.
+
+`ORDER BY process_by ASC` means the oldest deadline is always handled first, so a backlog degrades by
+latency rather than by dropping the most overdue work.
+
+### Two reasons a row is claimable
+
+A row's deadline passing is one. The other is its step already being `COMPLETED` with a `completed_at`:
+the judgement compares that timestamp against `process_by` and never consults the clock, so once the
+completion is recorded the outcome is fixed and the deadline arriving later would only confirm it.
+Applying it now is the same verdict, sooner — which is what keeps an on-time completion from reading as
+a null `sla_status` until its due date, weeks away for a step recorded early.
+
+The two claims are disjoint (`next_attempt_at > now` on the second), so no row is applied twice, and
+they share the batch: deadline-driven rows first, the second claim asking only for the room left. A full
+first batch skips the second query entirely — fallen deadlines are the pressing work, and the evaluator
+comes back for the rest in the next cycle.
+
+The second claim is cheap because `idx_step_instance_completed_unjudged` covers exactly the
+completed-but-unsettled set, which a sweep empties. Driving it the other way — scanning pending
+transitions and checking each step — would mean walking the entire future schedule every few seconds.
+
+### Why a driver and an applier
+
+`SlaTransitionEvaluator` polls and loops; `SlaTransitionApplier` holds the `@Transactional`
+boundary. They are separate beans because `@Transactional` takes effect through the Spring proxy — a
+scheduled method calling a transactional method **on itself** bypasses the proxy entirely and runs
+with no transaction at all. Splitting them is what makes the annotation real.
+
+The evaluator's `poll()` never propagates: a failed cycle must not kill the scheduler thread.
+
+## 4. What the applier does
+
+This service is the **only writer of `step_instance.sla_status`**. The Matcher Service records that a
+step completed and when — it never judges whether that was timely — so there is no question here of
+overwriting what another service decided. A step's `sla_status` is null until a threshold falls due and
+this service judges it.
+
+The judgement compares `step_instance.completed_at`, the clinical occurrence time of the completing
+event, against the row's `process_by`. The wall clock is not consulted: the row was claimed *because*
+its deadline passed, so all that remains to ask is whether the work had happened by then.
+
+| Row | Step when applied | `sla_status` | Deviation |
+|---|---|---|---|
+| `DUE_DATE_REACHED` | not completed | `OVERDUE` | `OVERDUE` |
+| `DUE_DATE_REACHED` | `completed_at >= process_by` | `OVERDUE` | `OVERDUE` |
+| `DUE_DATE_REACHED` | `completed_at < process_by` | `MET` | — |
+| `MISSED_DATE_REACHED` | not completed | `MISSED` | `MISSED` |
+| `MISSED_DATE_REACHED` | `completed_at >= process_by` | `MISSED` | `MISSED` |
+| `MISSED_DATE_REACHED` | `completed_at < process_by` | *unchanged* | — |
+
+A step whose row no longer exists is consumed rather than retried: there is no schedule left to honour.
+A step marked `COMPLETED` with no `completed_at` is treated as a breach — the row is better evidence
+than a missing timestamp, and letting it pass would hide the gap instead of surfacing it.
+
+### Only the due date settles an SLA as MET
+
+The last table row is the one worth being careful about. A step completed *between* its two thresholds
+did not breach the missed date — but it is not `MET` either. It is the `OVERDUE` that the due-date row
+made it.
+
+"Did not breach this threshold" and "met its SLA" coincide only at the due date. Reading the missed-date
+row as `MET` would relabel a late completion as on time, so `MET` is written on the `DUE_DATE_REACHED`
+row alone, and only over a null.
+
+Writes are **forward-only** for the same reason. `MET` and `MISSED` are settled outcomes, and `OVERDUE`
+must never replace `MISSED` — which is exactly what a retry applying a step's two rows out of order
+would otherwise do.
+
+### Optional steps
+
+A `MISSED` status and a `MISSED` deviation are both **`must`-only** — the rule the shared
+[Data Dictionary](../../cce-common-util/docs/data-dictionary.md#deviationtype) states. Nothing was
+required of an optional (`could`) step, so nothing was breached by its not happening.
+
+The exemption applies on **both** the completed and the outstanding path, which is the part worth being
+deliberate about: an optional step recorded *after* its missed threshold gets no `MISSED` deviation
+either. Exempting only the step that never arrived would penalise doing optional work late more heavily
+than not doing it at all.
+
+The exemption is `MISSED`-only. An optional step still takes an `OVERDUE` when it passes its due date:
+"running late" is a reportable fact about optional work, "breached" is not.
+
+### What it does not write
+
+The applier **never writes `step_status`**. That column belongs to the Matcher Service — see
+[Architecture Overview §4](../../cce-common-util/docs/architecture-overview.md#4-step-status-and-sla-status).
+
+Every `sla_status` write is mirrored into `step_instance_history` through the shared
+`StateTransitionHistoryWriter`, in the same transaction. Without it the time-driven half of a step's
+timeline would be missing from that table and from the CDC stream downstream of it: a step that went
+overdue and was never completed would show only its creation.
+
+### Retry
+
+A batch whose transaction rolled back is backed off rather than lost: `attempts` is incremented and
+`next_attempt_at` pushed out by `2^attempts` seconds, capped at `cce.sla.max-backoff-seconds`. The
+backoff write runs `REQUIRES_NEW`, because the transaction it is recovering from has already rolled
+back — joining it would roll the backoff back too, and the row would be retried immediately in a tight
+loop.
+
+`processed_by` records which replica applied each row, so a misbehaving instance is identifiable from
+the data.
+
+## 5. Intelligence on deviation
+
+When a deviation is newly recorded — not when it already existed — the shared
+[`IntelligenceActionEvaluator`](../../cce-common-util/docs/library-reference.md#intelligence--intelligenceactionevaluator)
+evaluates the step's intelligence actions and publishes any that fire to
+`cce.intelligence.triggers`.
+
+The de-duplication matters: without it, a transition retried after a failure would re-trigger an alert
+a clinician has already received. `DeviationRecorder` reports whether the row was new, and the
+evaluation is gated on that.
+
+This service is **produce-only** on Kafka. Its `KafkaConfig` declares a producer factory, a template
+and the outbound topic — no consumer factory, no listener container, no DLQ, because nothing is
+consumed.
+
+## 6. Observability
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `cce.sla.transitions.due` | gauge | rows the next cycle would claim: past their deadline, or belonging to an already-completed step — the primary health signal |
+| `cce.sla.transitions.applied` | counter | transitions that advanced a step's SLA |
+| `cce.sla.transitions.consumed` | counter | rows closed without recording a deviation — the event beat the deadline, the step was an exempt optional miss, or the SLA had already advanced |
+| `cce.sla.evaluator.cycles` | counter | polling cycles run |
+| `cce.sla.evaluator.batches.failed` | counter | batches that rolled back and were backed off |
+
+The gauge counts only what is **claimable** — it carries both claim predicates, counted by two queries
+and added. A gauge over every unprocessed row would fold in the entire future schedule, so it would
+track enrolment volume rather than lateness and could never sit near zero. Two queries rather than one
+`OR`: the branches read different indexes, and an `OR` across them plans as a sequential scan of the
+whole pending schedule on every scrape.
+
+The gauge is the one to alert on. It sits near zero in a steady state and rises when transitions fall
+due faster than they are applied — which is the failure this service can actually have. A sustained
+rise means the sweep is not keeping up; a rise with `batches.failed` climbing alongside means rows are
+failing and backing off rather than the sweep being slow.
+
+`cycles` incrementing with everything else flat is the normal idle signature, and distinguishes "no
+work to do" from "scheduler stopped".
+
+## 7. Scaling
+
+Scales with the **backlog**, not with inbound traffic — that is the reason it is a separate service.
+A burst of clinical events cannot delay the SLA sweep, and a large SLA backlog cannot delay event
+processing.
+
+Replicas are safe to add freely: the claim protocol needs no coordination, and adding an instance adds
+claim throughput directly. The limiting factor is database contention on
+`step_sla_state_transition`, not anything in the application.
+
+`cce.sla.batch-size` trades transaction length against round trips. A larger batch holds row locks
+longer, which matters only if the Matcher Service is inserting into the same table heavily at the same
+time.
+
+## 8. Security
+
+No authentication at the application layer; the read API is expected to sit behind the gateway
+service. The service performs no writes on behalf of a caller — every write it makes is driven by the
+scheduler, from rows another service created.

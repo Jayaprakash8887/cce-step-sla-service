@@ -1,0 +1,60 @@
+# ===== Build output =====
+build/
+
+# ===== IDE files =====
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+*.swp
+*.swo
+*~
+
+# ===== Gradle =====
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== Environment / secrets =====
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.properties
+
+# ===== Docker =====
+docker-compose.override.yml
+
+# ===== Test / coverage =====
+*.exec
+jacoco.exec
+coverage/
+test-output/
+
+# ===== Misc =====
+*.bak
+*.tmp
+*.orig
+hs_err_pid*
+replay_pid*
+
+artifacts/
+bin/
+target/
+
+.claude/
+.github/copilot-instructions.md
