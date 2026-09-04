@@ -1,6 +1,6 @@
-# CCE Step SLA Service
+# CCE Compliance Service
 
-The time plane of the CCE system. Claims the SLA transitions the Matcher Service scheduled as their
+The time plane of the CCE system. Picks up the SLA transitions the Matcher Service scheduled as their
 deadlines pass, writes `step_instance.sla_status` (it is the column's only writer), records the
 resulting `OVERDUE` / `MISSED`
 deviations, and publishes the intelligence actions they trigger.
@@ -29,7 +29,7 @@ sequence: [Developer Setup](docs/developer-setup.md#quick-start).
 
 | Document | Contents |
 |---|---|
-| [Architecture & Design](docs/architecture-overview.md) | The claim protocol, the applier's behaviour table, retry and backoff, observability, scaling |
+| [Architecture & Design](docs/architecture-overview.md) | The fetch-and-apply cycle, the applier's behaviour table, retry and backoff, observability, scaling |
 | [API Reference](docs/api-reference.md) | The read-only intelligence-event API and the operational endpoints |
 | [Developer Setup](docs/developer-setup.md) | Prerequisites, configuration and tuning, project layout, testing, and the invariants to preserve |
 | [Deployment Guide](docs/deployment-guide.md) | Docker and Kubernetes, replica scaling, alerts, troubleshooting |
@@ -54,7 +54,7 @@ Gradle composite build assumes.
                           ▼
                     SlaTransitionApplier         one transaction per batch
                           │
-   claim: deadline passed, or step already COMPLETED ── FOR UPDATE SKIP LOCKED
+   fetch: deadline passed, or step already COMPLETED ── FOR UPDATE SKIP LOCKED
                           │
           ┌───────────────┼────────────────┐
           ▼               ▼                ▼
@@ -64,13 +64,13 @@ Gradle composite build assumes.
                                   Kafka cce.intelligence.triggers
 ```
 
-The row lock **is** the claim — no lease table, no heartbeat, no leader election. Every replica can
+The row lock **is** what reserves the row — no lease table, no heartbeat, no leader election. Every replica can
 poll the same table concurrently, and a replica that dies mid-batch releases its rows immediately.
 
-A row is claimed either because its deadline passed or because its step is already completed: the
+A row is fetched either because its deadline passed or because its step is already completed: the
 verdict reads `completed_at` against `process_by` and never the wall clock, so a completion settles its
 SLA on the next sweep instead of waiting for a threshold that would only confirm it. Details in
-[Architecture §3](docs/architecture-overview.md#3-the-claim-protocol).
+[Architecture §3](docs/architecture-overview.md#3-the-fetch-and-apply-cycle).
 
 ## API
 
@@ -89,5 +89,5 @@ Read-only. Everything this service writes is driven by its scheduler, never by a
 ./gradlew jacocoTestReport  # build/reports/jacoco/test/html/index.html
 ```
 
-Concurrent-claim behaviour depends on real `FOR UPDATE SKIP LOCKED` semantics and must be verified
+Concurrent-fetch behaviour depends on real `FOR UPDATE SKIP LOCKED` semantics and must be verified
 against PostgreSQL, not H2.

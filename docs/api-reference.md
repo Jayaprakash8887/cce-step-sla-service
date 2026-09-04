@@ -1,9 +1,9 @@
-# API Reference — Step SLA Service
+# API Reference — Compliance Service
 
 Base URL: `http://<host>:8092`
 
 This service has a **read-only** HTTP surface. Everything it writes is driven by its scheduler, not by
-a request — see [Architecture §3](architecture-overview.md#3-the-claim-protocol).
+a request — see [Architecture §3](architecture-overview.md#3-the-fetch-and-apply-cycle).
 
 Error bodies and status codes come from the shared `GlobalExceptionHandler`:
 [Library Reference §5](../../cce-common-util/docs/library-reference.md#5-exception).

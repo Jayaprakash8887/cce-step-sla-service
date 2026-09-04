@@ -1,4 +1,4 @@
-# Deployment Guide — Step SLA Service
+# Deployment Guide — Compliance Service
 
 Deploy **last**. This service creates no tables and validates its JPA mapping at startup, so it will
 fail fast against a `ccedb` the other two services have not yet migrated. Ordering rationale:
@@ -41,18 +41,18 @@ misbehaving replica.
 context:
 
 ```bash
-cd ..            # the directory containing cce-step-sla-service and cce-common-util
-docker build -f cce-step-sla-service/Dockerfile -t cce-step-sla-service:2.0.0 .
+cd ..            # the directory containing cce-compliance-service and cce-common-util
+docker build -f cce-compliance-service/Dockerfile -t cce-compliance-service:2.0.0 .
 ```
 
 ```bash
-docker run -d --name cce-step-sla-service \
+docker run -d --name cce-compliance-service \
   -p 8092:8080 \
   -e DB_HOST=postgres-host -e DB_PORT=5433 \
   -e DB_USERNAME=cce_user -e DB_PASSWORD='<secret>' \
   -e KAFKA_BOOTSTRAP_SERVERS=kafka-host:9092 \
-  -e CCE_SLA_INSTANCE_ID=step-sla-1 \
-  cce-step-sla-service:2.0.0
+  -e CCE_SLA_INSTANCE_ID=compliance-1 \
+  cce-compliance-service:2.0.0
 ```
 
 The image pins `SERVER_PORT=8080` to match its `EXPOSE` and healthcheck; the application's own default
@@ -64,18 +64,18 @@ outside Docker is `8092`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: cce-step-sla-service
+  name: cce-compliance-service
 spec:
   replicas: 2
   selector:
-    matchLabels: { app: cce-step-sla-service }
+    matchLabels: { app: cce-compliance-service }
   template:
     metadata:
-      labels: { app: cce-step-sla-service }
+      labels: { app: cce-compliance-service }
     spec:
       containers:
-        - name: cce-step-sla-service
-          image: cce-step-sla-service:2.0.0
+        - name: cce-compliance-service
+          image: cce-compliance-service:2.0.0
           ports: [{ containerPort: 8080 }]
           env:
             - name: CCE_SLA_INSTANCE_ID
@@ -97,8 +97,8 @@ spec:
             limits:   { memory: 2Gi, cpu: "2" }
 ```
 
-**Multiple replicas are safe and useful.** The claim protocol needs no coordination — no leader
-election, no lease, no partition assignment — so an added replica adds claim throughput directly. This
+**Multiple replicas are safe and useful.** The fetch-and-apply cycle needs no coordination — no leader
+election, no lease, no partition assignment — so an added replica adds throughput directly. This
 is unlike the Matcher Service, whose parallelism is bounded by Kafka partitions.
 
 Scale on the `cce.sla.transitions.due` gauge rather than on CPU: this service is

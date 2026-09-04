@@ -1,4 +1,4 @@
-# Developer Setup — Step SLA Service
+# Developer Setup — Compliance Service
 
 ## Prerequisites
 
@@ -41,7 +41,7 @@ curl -s localhost:8092/actuator/health
 | `DB_USERNAME` / `DB_PASSWORD` | `cce_user` / `cce_pass` | needs **no** DDL rights |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | |
 | `CCE_SLA_POLL_INTERVAL_MS` | `5000` | how often to look for due transitions |
-| `CCE_SLA_BATCH_SIZE` | `100` | rows claimed per transaction |
+| `CCE_SLA_BATCH_SIZE` | `100` | rows fetched per transaction |
 | `CCE_SLA_INSTANCE_ID` | `$HOSTNAME` | recorded in `processed_by` |
 | `CCE_SLA_MAX_BACKOFF_SECONDS` | `3600` | cap on the `2^attempts` retry backoff |
 | `CCE_PARSED_PROTOCOL_CACHE_SIZE` | `256` | shared parsed-protocol cache |
@@ -51,7 +51,7 @@ curl -s localhost:8092/actuator/health
 
 `poll-interval-ms` is the steady-state cost, not the drain rate — a backlog is cleared within a single
 cycle because batches are drained until one comes back short
-([Architecture §3](architecture-overview.md#3-the-claim-protocol)). Lowering it shortens the *detection*
+([Architecture §3](architecture-overview.md#3-the-fetch-and-apply-cycle)). Lowering it shortens the *detection*
 delay for a newly-due transition; it does not make a backlog clear faster.
 
 `batch-size` trades transaction length against round trips. Larger batches hold row locks longer, which
@@ -61,18 +61,18 @@ time.
 ## Project layout
 
 ```
-org.openphc.cce.stepsla
+org.openphc.cce.compliance
 ├── service/SlaTransitionEvaluator   @Scheduled driver — polls, loops, holds no transaction
-├── service/SlaTransitionApplier     the @Transactional boundary — claim and apply
+├── service/SlaTransitionApplier     the @Transactional boundary — fetch and apply
 ├── service/IntelligenceEventLogService
-├── domain/repository/SlaTransitionClaimRepository   the SKIP LOCKED claim query
+├── domain/repository/SlaTransitionFetchRepository   the SKIP LOCKED fetch queries
 ├── web/controller/IntelligenceEventLogController
 ├── web/DtoMapper, web/dto/
 └── config/  KafkaConfig (produce-only), ObservabilityConfig
 ```
 
 Entities, repositories, `DeviationRecorder` and `IntelligenceActionEvaluator` come from
-`cce-common-util`. What this service adds is the claim query, the transaction boundary and the
+`cce-common-util`. What this service adds is the fetch queries, the transaction boundary and the
 scheduler.
 
 `build.gradle` reflects that: it declares no FHIR, JSONLogic or Flyway dependency of its own. The FHIR
@@ -91,17 +91,17 @@ The driver/applier split is not stylistic — see
 ./gradlew jacocoTestReport
 ```
 
-The coverage gate is **0.98** instruction coverage, excluding `StepSlaServiceApplication`.
+The coverage gate is **0.98** instruction coverage, excluding `ComplianceServiceApplication`.
 
 `ApplicationContextTest` boots the real context on H2 with Flyway disabled and the poll interval widened so the sweep does not repeat. It is
 the only test that exercises the wiring: everything else constructs its subject directly, which leaves a
 bean this service needs at runtime but never names in source invisible behind the coverage figure. It
-also validates the claim query — Spring Data parses every `@Query` at bootstrap, so a typo in the claim
-JPQL fails there rather than on the first poll in production. That matters more here than in the sibling
+also validates the fetch queries — Spring Data parses every `@Query` at bootstrap, so a typo in the JPQL
+fails there rather than on the first poll in production. That matters more here than in the sibling
 services, because this one runs `ddl-auto: validate` against a schema it does not own: a mapping it gets
 wrong is a failure to start.
 
-There is no integration-test source set. The behaviour that would justify one — concurrent claims
+There is no integration-test source set. The behaviour that would justify one — concurrent fetches
 across replicas — cannot be reproduced against H2, because `FOR UPDATE SKIP LOCKED` semantics are the
 thing under test. Verify that against real PostgreSQL.
 
@@ -117,7 +117,7 @@ Four invariants to preserve:
 1. **Never write `step_status`.** It belongs to the Matcher Service. Column ownership is what keeps the
    two services from overwriting each other —
    [Architecture Overview §4](../../cce-common-util/docs/architecture-overview.md#4-step-status-and-sla-status).
-2. **Judge against `completed_at`, never the wall clock.** The row was claimed because its deadline
+2. **Judge against `completed_at`, never the wall clock.** The row was fetched because its deadline
    passed; the only remaining question is whether the work had happened by then, and the clinical
    occurrence time is the evidence for that.
 3. **Write `MET` only on the `DUE_DATE_REACHED` row, and only over a null.** Beating the missed date

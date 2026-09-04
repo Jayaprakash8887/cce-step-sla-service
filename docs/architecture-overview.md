@@ -13,7 +13,7 @@ only what is specific to this service.
 
 Everything driven by **time passing**:
 
-1. Claim the `step_sla_state_transition` rows the Matcher Service scheduled, once they fall due.
+1. Pick up the `step_sla_state_transition` rows the Matcher Service scheduled, once they fall due.
 2. Write `step_instance.sla_status` — this service is its only writer.
 3. Record the resulting `OVERDUE` / `MISSED` deviations.
 4. Evaluate the intelligence actions those deviations trigger, and publish them.
@@ -36,31 +36,49 @@ rather than as a runtime error hours later.
 Deploy **last**. Table ownership and the full ordering rationale:
 [Data Dictionary §3](../../cce-common-util/docs/data-dictionary.md#3-ownership).
 
-## 3. The claim protocol
+## 3. The fetch-and-apply cycle
+
+Every cycle does the same two things: **fetch** a batch of `step_sla_state_transition` rows that are
+ready to be processed, then **apply** them.
+
+Read the two fetches in the diagram as **independent queries, not a pipeline**. They read disjoint sets
+of rows and neither one uses the other's results. They run one after the other only because they share a
+single batch: the first takes what it needs, the second asks for whatever room is left. Nothing in the
+second query depends on *what* the first found — only on *how many*.
 
 ```mermaid
 flowchart TD
-    S["@Scheduled poll<br/>every cce.sla.poll-interval-ms"] --> D["claimDue(now, batchSize)<br/>deadline has passed"]
-    D --> C["claimForCompletedSteps(now, room left)<br/>step already COMPLETED"]
-    C --> E{"rows returned?"}
+    S["Scheduled poll<br/>every cce.sla.poll-interval-ms"] --> D
+
+    subgraph FETCH["Fetch — two independent queries sharing one batch"]
+        direction TB
+        D["1 · FetchDueTransitions(now, batchSize)<br/>rows whose deadline has passed"]
+        C["2 · FetchCompletedStepTransitions(now, room left)<br/>rows whose step is already COMPLETED"]
+        D -->|"then — no rows handed over,<br/>only the unused batch room"| C
+    end
+
+    C --> E{"any rows fetched?"}
     E -->|"none"| Z["cycle ends — one empty query"]
-    E -->|"some"| A["apply each row<br/>same transaction as the claim"]
+    E -->|"some"| A["apply each row<br/>same transaction as the fetch"]
     A --> F{"batch full?"}
-    F -->|yes| D
+    F -->|"yes"| D
     F -->|"short"| Z
     A -.->|"transaction rolled back"| B["backOff(ids)<br/>REQUIRES_NEW"]
 ```
 
+Both queries live on `SlaTransitionFetchRepository`, and both return transition rows rather than steps
+— which is what the names say.
+
 ### Step by step
 
-**`@Scheduled poll`** — a Spring `fixedDelay` timer, default 5s, is the only thing that starts work in
-this service. `poll()` catches everything `evaluateDue()` throws, because an exception escaping a
+**Scheduled poll** — a Spring `fixedDelay` timer, default 5s, is the only thing that starts work in this
+service. `poll()` catches everything `evaluateDue()` throws, because an exception escaping a
 `@Scheduled` method stops the schedule. Every replica runs its own timer.
 
-**`claimDue(now, batchSize)`** — `processed = false AND next_attempt_at <= now`, ordered by
-`process_by`, under `FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2` timeout hint
-Hibernate translates to `SKIP LOCKED`). The predicate selects on `next_attempt_at` rather than
-`process_by`: the two are equal when the Matcher Service writes the row, and a failure pushes
+**1 · `fetchDueTransitions(now, batchSize)`** — fetches rows where `processed = false AND next_attempt_at <=
+now`, ordered by `process_by`, under `FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2`
+timeout hint Hibernate translates to `SKIP LOCKED`). The predicate selects on `next_attempt_at` rather
+than `process_by`: the two are equal when the Matcher Service writes the row, and a failure pushes
 `next_attempt_at` out so a retry is deferred without rewriting `process_by`, which stays the immutable
 record of when the deadline fell. The partial index `idx_sslt_due` covers exactly this predicate, so the
 scan touches only the unprocessed backlog.
@@ -69,54 +87,54 @@ Note what it does *not* read: this is a single-table query with no join to `step
 nothing about whether the step completed. Eligibility here is purely "this row's gate has passed"; what
 the row *means* is decided later, in the apply.
 
-**`claimForCompletedSteps(now, room left)`** — runs only if the first claim left room in the batch, and
-asks for exactly that much. It takes rows whose step is already `COMPLETED` with a `completed_at` and an
-`sla_status` still null or `OVERDUE`, excluding the rows `claimDue` already takes
-(`next_attempt_at > now`). These are judged ahead of their deadline; the reason is below. A step marked
-`COMPLETED` with no `completed_at` is invisible here and reachable only through `claimDue` — there is no
-timestamp to judge it early by.
+**2 · `fetchCompletedStepTransitions(now, room left)`** — runs only if the first query left room in the batch, and
+asks for exactly that much. It fetches rows whose step is already `COMPLETED` with a `completed_at` and
+an `sla_status` still null or `OVERDUE`, and excludes the rows the first query already takes
+(`next_attempt_at > now`) — which is what keeps the two sets disjoint. These rows are judged ahead of
+their deadline; the reason is below. A step marked `COMPLETED` with no `completed_at` is invisible here
+and reachable only through the first query — there is no timestamp to judge it early by.
 
-**`rows returned?`** — the size of the two claims combined. Zero is the steady state: one empty indexed
-query per interval, and the cycle ends.
+**any rows fetched?** — the size of the two results combined. Zero is the steady state: one empty
+indexed query per interval, and the cycle ends.
 
-**`apply each row`** — per row: increment `attempts` (past five, the row is logged as an error every
-cycle rather than failing quietly), load the step, decide whether the threshold was breached, write
+**apply each row** — per row: increment `attempts` (past five, the row is logged as an error every cycle
+rather than failing quietly), load the step, decide whether the threshold was breached, write
 `sla_status` forward-only, record the deviation if there is one, mirror the write into
 `step_instance_history`, and mark the row processed with `processed_by`. §4 covers the judgement itself.
-This is where `completed_at` is read, and it is one code path with no branch on which claim brought the
-row in — which is why applying a row early and applying it late give the same verdict.
-Each claimed id is also appended to a list the evaluator holds — plain memory rather than transactional
-state, so it survives a rollback and the failure path knows which rows to defer.
+This is where `completed_at` is read, and it is one code path with no branch on which query fetched the
+row — which is why applying a row early and applying it late give the same verdict. Each fetched id is
+also appended to a list the evaluator holds — plain memory rather than transactional state, so it
+survives a rollback and the failure path knows which rows to defer.
 
-**`batch full?`** — a batch that came back the full `cce.sla.batch-size` means there is probably more, so
-the loop claims again within the same cycle; a short batch means the backlog is drained.
+**batch full?** — a result that came back the full `cce.sla.batch-size` means there is probably more, so
+the loop fetches again within the same cycle; a short batch means the backlog is drained.
 
-**`backOff(ids)`** — the dashed edge, taken when `claimAndApply` throws. The batch rolled back entirely,
+**`backOff(ids)`** — the dashed edge, taken when `fetchAndApply` throws. The batch rolled back entirely,
 so nothing was marked processed and no deviation was written. The evaluator counts the failed batch,
-defers the ids it had claimed, and ends the cycle rather than starting another batch — whatever broke is
+defers the ids it had fetched, and ends the cycle rather than starting another batch — whatever broke is
 likely to break the next one too. See [Retry](#retry) for the backoff itself.
 
 Three properties make this safe without any coordination machinery:
 
-**The row lock is the claim.** `FOR UPDATE SKIP LOCKED` means a row locked by one replica is
-*invisible* to the others rather than contended, so every replica can poll the same table
-concurrently. There is no lease table, no heartbeat, and no leader election. A replica that dies
-mid-batch drops its connection, its locks release, and the work is immediately claimable again — no
-lease expiry to wait out.
+**The row lock is what reserves the row.** `FOR UPDATE SKIP LOCKED` means a row locked by one replica is
+*invisible* to the others rather than contended, so every replica can poll the same table concurrently.
+There is no lease table, no heartbeat, and no leader election. A replica that dies mid-batch drops its
+connection, its locks release, and the work is immediately available again — no lease expiry to wait
+out.
 
-**Claim and apply share one transaction.** Claiming in one transaction and applying in another would
+**Fetch and apply share one transaction.** Fetching in one transaction and applying in another would
 leave a window where a row is marked taken but not yet acted on, and a crash inside that window makes
-the state permanent. Here there is no such window: either the row is applied and committed, or the
-lock is released and nothing happened.
+the state permanent. Here there is no such window: either the row is applied and committed, or the lock
+is released and nothing happened.
 
-**Batches drain within a cycle.** The evaluator keeps claiming until a batch comes back short, so a
+**Batches drain within a cycle.** The evaluator keeps fetching until a batch comes back short, so a
 backlog that accumulated while the service was down clears in one cycle rather than one batch per
 interval. `MAX_BATCHES_PER_CYCLE` (100) stops a pathological backlog from monopolising the thread.
 
 `ORDER BY process_by ASC` means the oldest deadline is always handled first, so a backlog degrades by
 latency rather than by dropping the most overdue work.
 
-### Two reasons a row is claimable
+### Two reasons a row is ready to process
 
 A row's deadline passing is one. The other is its step already being `COMPLETED` with a `completed_at`:
 the judgement compares that timestamp against `process_by` and never consults the clock, so once the
@@ -124,12 +142,12 @@ completion is recorded the outcome is fixed and the deadline arriving later woul
 Applying it now is the same verdict, sooner — which is what keeps an on-time completion from reading as
 a null `sla_status` until its due date, weeks away for a step recorded early.
 
-The two claims are disjoint (`next_attempt_at > now` on the second), so no row is applied twice, and
-they share the batch: deadline-driven rows first, the second claim asking only for the room left. A full
+The two queries are disjoint (`next_attempt_at > now` on the second), so no row is applied twice, and
+they share the batch: deadline-driven rows first, the second query asking only for the room left. A full
 first batch skips the second query entirely — fallen deadlines are the pressing work, and the evaluator
 comes back for the rest in the next cycle.
 
-The second claim is cheap because `idx_step_instance_completed_unjudged` covers exactly the
+The second query is cheap because `idx_step_instance_completed_unjudged` covers exactly the
 completed-but-unsettled set, which a sweep empties. Driving it the other way — scanning pending
 transitions and checking each step — would mean walking the entire future schedule every few seconds.
 
@@ -150,7 +168,7 @@ overwriting what another service decided. A step's `sla_status` is null until a 
 this service judges it.
 
 The judgement compares `step_instance.completed_at`, the clinical occurrence time of the completing
-event, against the row's `process_by`. The wall clock is not consulted: the row was claimed *because*
+event, against the row's `process_by`. The wall clock is not consulted: the row was fetched *because*
 its deadline passed, so all that remains to ask is whether the work had happened by then.
 
 | Row | Step when applied | `sla_status` | Deviation |
@@ -234,13 +252,13 @@ consumed.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `cce.sla.transitions.due` | gauge | rows the next cycle would claim: past their deadline, or belonging to an already-completed step — the primary health signal |
+| `cce.sla.transitions.due` | gauge | rows the next cycle would fetch: past their deadline, or belonging to an already-completed step — the primary health signal |
 | `cce.sla.transitions.applied` | counter | transitions that advanced a step's SLA |
 | `cce.sla.transitions.consumed` | counter | rows closed without recording a deviation — the event beat the deadline, the step was an exempt optional miss, or the SLA had already advanced |
 | `cce.sla.evaluator.cycles` | counter | polling cycles run |
 | `cce.sla.evaluator.batches.failed` | counter | batches that rolled back and were backed off |
 
-The gauge counts only what is **claimable** — it carries both claim predicates, counted by two queries
+The gauge counts only what is **ready to process** — it carries both fetch predicates, counted by two queries
 and added. A gauge over every unprocessed row would fold in the entire future schedule, so it would
 track enrolment volume rather than lateness and could never sit near zero. Two queries rather than one
 `OR`: the branches read different indexes, and an `OR` across them plans as a sequential scan of the
@@ -260,8 +278,8 @@ Scales with the **backlog**, not with inbound traffic — that is the reason it 
 A burst of clinical events cannot delay the SLA sweep, and a large SLA backlog cannot delay event
 processing.
 
-Replicas are safe to add freely: the claim protocol needs no coordination, and adding an instance adds
-claim throughput directly. The limiting factor is database contention on
+Replicas are safe to add freely: the fetch-and-apply cycle needs no coordination, and adding an instance
+adds throughput directly. The limiting factor is database contention on
 `step_sla_state_transition`, not anything in the application.
 
 `cce.sla.batch-size` trades transaction length against round trips. A larger batch holds row locks
