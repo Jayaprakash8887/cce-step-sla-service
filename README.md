@@ -67,9 +67,10 @@ Gradle composite build assumes.
 The row lock **is** what reserves the row — no lease table, no heartbeat, no leader election. Every replica can
 poll the same table concurrently, and a replica that dies mid-batch releases its rows immediately.
 
-A row is fetched either because its deadline passed or because its step is already completed: the
-verdict reads `completed_at` against `process_by` and never the wall clock, so a completion settles its
-SLA on the next sweep instead of waiting for a threshold that would only confirm it. Details in
+A row is fetched either because its schedule came round or because its step is already completed: the
+verdict reads `completed_at` — against the step's `due_date` for `MET`, against the row's `process_by`
+for a breach — and never the wall clock, so a completion settles its SLA on the next sweep instead of
+waiting for a schedule that would only confirm it. Details in
 [Architecture §3](docs/architecture-overview.md#3-the-fetch-and-apply-cycle).
 
 ## API

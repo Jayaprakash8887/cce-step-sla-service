@@ -137,8 +137,9 @@ latency rather than by dropping the most overdue work.
 ### Two reasons a row is ready to process
 
 A row's deadline passing is one. The other is its step already being `COMPLETED` with a `completed_at`:
-the judgement compares that timestamp against `process_by` and never consults the clock, so once the
-completion is recorded the outcome is fixed and the deadline arriving later would only confirm it.
+the judgement compares that timestamp against the step's deadline and never consults the clock, so
+once the completion is recorded the outcome is fixed and the schedule coming round later would only
+confirm it.
 Applying it now is the same verdict, sooner — which is what keeps an on-time completion from reading as
 a null `sla_status` until its due date, weeks away for a step recorded early.
 
@@ -168,14 +169,28 @@ overwriting what another service decided. A step's `sla_status` is null until a 
 this service judges it.
 
 The judgement compares `step_instance.completed_at`, the clinical occurrence time of the completing
-event, against the row's `process_by`. The wall clock is not consulted: the row was fetched *because*
-its deadline passed, so all that remains to ask is whether the work had happened by then.
+event, against the threshold the row stands for. The wall clock is not consulted: all that remains to
+ask is whether the work had happened by then.
+
+Which column supplies that threshold depends on the verdict:
+
+- **`MET` is measured against `step_instance.due_date`** — the deadline the work was expected by, a
+  fact about the step, written once by the Matcher Service at creation and never updated. Whether the
+  work was *on time* is a question about the step, so it is asked of the step.
+- **`OVERDUE` and `MISSED` are measured against the row's `process_by`** — a breach is what the
+  schedule exists to detect, and the row is what carries it. `process_by` is fetched under
+  `SKIP LOCKED`, deferred through `next_attempt_at` on failure, marked processed, counted as backlog.
+
+The two normally hold the same instant: the Matcher writes `due_date` and the `DUE_DATE_REACHED` row's
+`process_by` from one value in one transaction, and nothing rewrites either afterwards — a retry defers
+`next_attempt_at`, never `process_by`.
 
 | Row | Step when applied | `sla_status` | Deviation |
 |---|---|---|---|
 | `DUE_DATE_REACHED` | not completed | `OVERDUE` | `OVERDUE` |
 | `DUE_DATE_REACHED` | `completed_at >= process_by` | `OVERDUE` | `OVERDUE` |
-| `DUE_DATE_REACHED` | `completed_at < process_by` | `MET` | — |
+| `DUE_DATE_REACHED` | `completed_at < process_by`, `< due_date` | `MET` | — |
+| `DUE_DATE_REACHED` | `completed_at < process_by`, `>= due_date` | *unchanged* | — |
 | `MISSED_DATE_REACHED` | not completed | `MISSED` | `MISSED` |
 | `MISSED_DATE_REACHED` | `completed_at >= process_by` | `MISSED` | `MISSED` |
 | `MISSED_DATE_REACHED` | `completed_at < process_by` | *unchanged* | — |
@@ -193,6 +208,14 @@ made it.
 "Did not breach this threshold" and "met its SLA" coincide only at the due date. Reading the missed-date
 row as `MET` would relabel a late completion as on time, so `MET` is written on the `DUE_DATE_REACHED`
 row alone, and only over a null.
+
+Because the two verdicts read different columns, a due-date row has a third outcome: the schedule was
+kept but the step's own due date was not beaten. Neither verdict holds, so the row is consumed and
+`sla_status` is left as it stands — the same treatment a kept missed-date row gets. It is unreachable
+while `due_date` and `process_by` agree, and defined rather than left implicit in case they stop.
+
+A step with no `due_date` falls back to the row's `process_by` for the `MET` question, and logs a
+warning. That is where the deadline lived before the column existed, so it is the only evidence left.
 
 Writes are **forward-only** for the same reason. `MET` and `MISSED` are settled outcomes, and `OVERDUE`
 must never replace `MISSED` — which is exactly what a retry applying a step's two rows out of order
