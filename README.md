@@ -51,26 +51,37 @@ Gradle composite build assumes.
 ```
 @Scheduled poll ──> SlaTransitionEvaluator      drives; holds no transaction
                           │
-                          ▼
-                    SlaTransitionApplier         one transaction per batch
-                          │
-   fetch: deadline passed, or step already COMPLETED ── FOR UPDATE SKIP LOCKED
-                          │
-          ┌───────────────┼────────────────┐
-          ▼               ▼                ▼
-   step_instance      deviation      intelligence_event_log
-   .sla_status                              │
-                                            ▼
-                                  Kafka cce.intelligence.triggers
+        ┌─────────────────┴─────────────────┐
+        ▼                                   ▼
+  1. breach sweep                     2. on-time sweep
+  step_sla_state_transition           step_instance
+  deadline passed, or step            COMPLETED, sla_status NULL,
+  already COMPLETED                   completed_at < due_date
+        │                                   │
+        ▼                                   ▼
+  SlaTransitionApplier                write MET
+  one transaction per batch           (+ history row)
+        │
+        ├───────────────┬────────────────┐
+        ▼               ▼                ▼
+  step_instance      deviation      intelligence_event_log
+  .sla_status                              │
+                                           ▼
+                                 Kafka cce.intelligence.triggers
 ```
+
+Both sweeps run every cycle. A breach needs a schedule to come round; whether work was recorded on
+time needs only the step's own `completed_at` and `due_date`, so it is settled without one — which is
+what stops an early completion reading as null until its due date, weeks away.
 
 The row lock **is** what reserves the row — no lease table, no heartbeat, no leader election. Every replica can
 poll the same table concurrently, and a replica that dies mid-batch releases its rows immediately.
 
-A row is fetched either because its schedule came round or because its step is already completed: the
-verdict reads `completed_at` — against the step's `due_date` for `MET`, against the row's `process_by`
-for a breach — and never the wall clock, so a completion settles its SLA on the next sweep instead of
-waiting for a schedule that would only confirm it. Details in
+A row is fetched either because its schedule came round or because its step is already completed, and
+what it decides is a breach: `completed_at` against its `process_by`, never the wall clock. `MET` is
+not a row's to decide — the on-time sweep settles that from the step's own `completed_at` and
+`due_date`, so an early completion is recorded without waiting for a deadline that would only confirm
+it. Details in
 [Architecture §3](docs/architecture-overview.md#3-the-fetch-and-apply-cycle).
 
 ## API
