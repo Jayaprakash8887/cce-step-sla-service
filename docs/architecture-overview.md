@@ -1,4 +1,4 @@
-# Architecture & Design — Step SLA Service
+# Architecture & Design — Compliance Service
 
 > The time plane: what happens because a deadline passed, not because an event arrived.
 
@@ -50,6 +50,51 @@ flowchart TD
     F -->|"short"| Z
     A -.->|"transaction rolled back"| B["backOff(ids)<br/>REQUIRES_NEW"]
 ```
+
+### Step by step
+
+**`@Scheduled poll`** — a Spring `fixedDelay` timer, default 5s, is the only thing that starts work in
+this service. `poll()` catches everything `evaluateDue()` throws, because an exception escaping a
+`@Scheduled` method stops the schedule. Every replica runs its own timer.
+
+**`claimDue(now, batchSize)`** — `processed = false AND next_attempt_at <= now`, ordered by
+`process_by`, under `FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2` timeout hint
+Hibernate translates to `SKIP LOCKED`). The predicate selects on `next_attempt_at` rather than
+`process_by`: the two are equal when the Matcher Service writes the row, and a failure pushes
+`next_attempt_at` out so a retry is deferred without rewriting `process_by`, which stays the immutable
+record of when the deadline fell. The partial index `idx_sslt_due` covers exactly this predicate, so the
+scan touches only the unprocessed backlog.
+
+Note what it does *not* read: this is a single-table query with no join to `step_instance`, so it knows
+nothing about whether the step completed. Eligibility here is purely "this row's gate has passed"; what
+the row *means* is decided later, in the apply.
+
+**`claimForCompletedSteps(now, room left)`** — runs only if the first claim left room in the batch, and
+asks for exactly that much. It takes rows whose step is already `COMPLETED` with a `completed_at` and an
+`sla_status` still null or `OVERDUE`, excluding the rows `claimDue` already takes
+(`next_attempt_at > now`). These are judged ahead of their deadline; the reason is below. A step marked
+`COMPLETED` with no `completed_at` is invisible here and reachable only through `claimDue` — there is no
+timestamp to judge it early by.
+
+**`rows returned?`** — the size of the two claims combined. Zero is the steady state: one empty indexed
+query per interval, and the cycle ends.
+
+**`apply each row`** — per row: increment `attempts` (past five, the row is logged as an error every
+cycle rather than failing quietly), load the step, decide whether the threshold was breached, write
+`sla_status` forward-only, record the deviation if there is one, mirror the write into
+`step_instance_history`, and mark the row processed with `processed_by`. §4 covers the judgement itself.
+This is where `completed_at` is read, and it is one code path with no branch on which claim brought the
+row in — which is why applying a row early and applying it late give the same verdict.
+Each claimed id is also appended to a list the evaluator holds — plain memory rather than transactional
+state, so it survives a rollback and the failure path knows which rows to defer.
+
+**`batch full?`** — a batch that came back the full `cce.sla.batch-size` means there is probably more, so
+the loop claims again within the same cycle; a short batch means the backlog is drained.
+
+**`backOff(ids)`** — the dashed edge, taken when `claimAndApply` throws. The batch rolled back entirely,
+so nothing was marked processed and no deviation was written. The evaluator counts the failed batch,
+defers the ids it had claimed, and ends the cycle rather than starting another batch — whatever broke is
+likely to break the next one too. See [Retry](#retry) for the backoff itself.
 
 Three properties make this safe without any coordination machinery:
 
