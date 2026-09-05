@@ -61,7 +61,7 @@ flowchart TD
     subgraph FETCH["Fetch — two independent queries sharing one batch"]
         direction TB
         D["1 · FetchDueTransitions(now, batchSize)<br/>rows whose deadline has passed"]
-        C["2 · FetchCompletedStepTransitions(now, room left)<br/>rows whose step is already COMPLETED"]
+        C["2 · FetchLateStepTransitions(now, room left)<br/>rows whose step is already OVERDUE"]
         D -->|"then — no rows handed over,<br/>only the unused batch room"| C
     end
 
@@ -118,12 +118,24 @@ Note what it does *not* read: this is a single-table query with no join to `step
 nothing about whether the step completed. Eligibility here is purely "this row's gate has passed"; what
 the row *means* is decided later, in the apply.
 
-**2 · `fetchCompletedStepTransitions(now, room left)`** — runs only if the first query left room in the batch, and
-asks for exactly that much. It fetches rows whose step is already `COMPLETED` with a `completed_at` and
-an `sla_status` still null or `OVERDUE`, and excludes the rows the first query already takes
-(`next_attempt_at > now`) — which is what keeps the two sets disjoint. These rows are judged ahead of
-their deadline; the reason is below. A step marked `COMPLETED` with no `completed_at` is invisible here
-and reachable only through the first query — there is no timestamp to judge it early by.
+**2 · `fetchLateStepTransitions(now, room left)`** — runs only if the first query left room in the
+batch, and asks for exactly that much. It fetches rows whose step is already `COMPLETED` with a
+`completed_at` and an `sla_status` of `OVERDUE`, and excludes the rows the first query already takes
+(`next_attempt_at > now`) — which is what keeps the two sets disjoint. A step marked `COMPLETED` with no
+`completed_at` is invisible here and reachable only through the first query.
+
+**Why only `OVERDUE`.** A step still at null needs nothing from this query. If it beat its due date, the
+on-time sweep records `MET` and takes it out of the set; if it did not, its due-date row is already past
+and query 1 has it. What remains is a step already judged late, whose `MISSED_DATE_REACHED` row is the
+last one it holds — taken now rather than left pending against a date that can only confirm what is
+known.
+
+**And what it can actually record: nothing, in the ordinary case.** `completed_at` is clamped to `now`
+when a step completes, and a row that has never been attempted has `process_by == next_attempt_at`,
+which this query requires to be in the future. So `completed_at < process_by` always holds, the
+threshold is kept, and the row is consumed. Its job is to close out the step's schedule, not to reach a
+verdict. The exception is a row inside a back-off window, where `next_attempt_at` was pushed out while
+`process_by` stayed put and may now be past — there a breach is reachable.
 
 **any rows fetched?** — the size of the two results combined. Zero is the steady state: one empty
 indexed query per interval, and the cycle ends.
@@ -304,7 +316,7 @@ consumed.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `cce.sla.transitions.due` | gauge | rows the next cycle would fetch: past their deadline, or belonging to an already-completed step — the primary health signal |
+| `cce.sla.transitions.due` | gauge | rows the next cycle would fetch: past their deadline, or belonging to an already-`OVERDUE` step — the primary health signal |
 | `cce.sla.steps.on-time-unsettled` | gauge | completed steps that beat their due date and have not been recorded `MET` yet — on-time work awaiting acknowledgement, not lateness |
 | `cce.sla.transitions.applied` | counter | transitions that advanced a step's SLA |
 | `cce.sla.transitions.consumed` | counter | rows closed without recording a deviation — the event beat the deadline, the step was an exempt optional miss, or the SLA had already advanced |

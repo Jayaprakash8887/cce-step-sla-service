@@ -56,7 +56,7 @@ Gradle composite build assumes.
   1. breach sweep                     2. on-time sweep
   step_sla_state_transition           step_instance
   deadline passed, or step            COMPLETED, sla_status NULL,
-  already COMPLETED                   completed_at < due_date
+  already OVERDUE                     completed_at < due_date
         │                                   │
         ▼                                   ▼
   SlaTransitionApplier                write MET
@@ -77,7 +77,7 @@ what stops an early completion reading as null until its due date, weeks away.
 The row lock **is** what reserves the row — no lease table, no heartbeat, no leader election. Every replica can
 poll the same table concurrently, and a replica that dies mid-batch releases its rows immediately.
 
-A row is fetched either because its schedule came round or because its step is already completed, and
+A row is fetched either because its schedule came round or because its step is already `OVERDUE`, and
 what it decides is a breach: `completed_at` against its `process_by`, never the wall clock. `MET` is
 not a row's to decide — the on-time sweep settles that from the step's own `completed_at` and
 `due_date`, so an early completion is recorded without waiting for a deadline that would only confirm
