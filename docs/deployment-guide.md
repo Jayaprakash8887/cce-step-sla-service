@@ -124,16 +124,25 @@ the broker, it is a leftover from the pre-split monolith and can be deleted.
 | `/actuator/prometheus` | Scrape target |
 
 Note what readiness does **not** cover: the scheduler. A pod can be ready and serving the read API
-while its SLA sweep is stalled. The metric to alert on is
-`cce.sla.transitions.due` — see
-[Architecture §6](architecture-overview.md#6-observability) for how to read it alongside
+while its SLA sweep is stalled. The metrics to alert on are `cce.sla.transitions.due` and
+`cce.sla.steps.on-time-unsettled` — see
+[Architecture §6](architecture-overview.md#6-observability) for how to read them alongside
 `evaluator.cycles` and `batches.failed`.
+
+**The two sweeps fail independently, and only one of them is counted.** `poll()` runs the breach sweep
+and the on-time sweep in separate `try`/`catch` blocks, deliberately, so a failure in one cannot stop
+the other. But `evaluator.cycles` and `evaluator.batches.failed` are incremented by the breach sweep
+alone. An on-time sweep that throws on every cycle therefore leaves `cycles` climbing normally,
+`batches.failed` flat and `transitions.due` at zero, while no completion is ever recorded `MET`.
+`cce.sla.steps.on-time-unsettled` rising is the only signal there is, which is why it belongs on the
+alert list and not just on a dashboard.
 
 Suggested alerts:
 
 | Condition | Meaning |
 |---|---|
-| `cce.sla.transitions.due` rising for > 15 min | the sweep is not keeping up |
+| `cce.sla.transitions.due` rising for > 15 min | the breach sweep is not keeping up |
+| `cce.sla.steps.on-time-unsettled` rising for > 15 min | on-time completions are not being recorded `MET` — the second sweep is stalled |
 | `cce.sla.evaluator.batches.failed` increasing | rows are failing and backing off |
 | `cce.sla.evaluator.cycles` flat | the scheduler thread has stopped — liveness will not catch this |
 
@@ -152,4 +161,7 @@ This service owns no tables, so there is nothing here to back up. `step_sla_stat
 | `cycles` not incrementing | Scheduler stopped; restart the pod. Liveness will not detect this |
 | Deviations recorded but no intelligence delivered | Check `?published=false` on the [read API](api-reference.md#get-v1complianceintelligence-events) — the trigger may be built but unconfirmed |
 | The same alert delivered repeatedly | A transition retrying against an already-recorded deviation should be de-duplicated ([Architecture §5](architecture-overview.md#5-intelligence-on-deviation)); check `attempts` on the row |
-| A step's `sla_status` looks wrong for a completed step | This service does not overwrite a completed step's SLA — check what the Matcher Service set at completion |
+| A step's `sla_status` looks wrong for a completed step | This service is its **only** writer — Matcher records `step_status` and `completed_at` and never judges timeliness. Compare `completed_at` against the row's `process_by` ([Architecture §4](architecture-overview.md#4-what-the-applier-does)) |
+| A completed step stays at a null `sla_status` | It has no `due_date`, so nothing judges it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |
+| A settled step still has an unprocessed `MISSED_DATE_REACHED` row | Expected, not a stuck row. A row is taken when its own deadline arrives, so a step completed before its missed date keeps that row until the date passes — then it is consumed and records nothing |
+| `on-time-unsettled` rising while `due` sits at zero | The on-time sweep is failing; look for `On-time settlement cycle failed` in the logs. The breach sweep is unaffected, so `cycles` and `batches.failed` look healthy |
