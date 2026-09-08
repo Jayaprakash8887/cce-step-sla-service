@@ -65,7 +65,8 @@ org.openphc.cce.compliance
 ├── service/SlaTransitionEvaluator   @Scheduled driver — polls, loops, holds no transaction
 ├── service/SlaTransitionApplier     the @Transactional boundary — fetch and apply
 ├── service/IntelligenceEventLogService
-├── domain/repository/SlaTransitionFetchRepository   the SKIP LOCKED fetch queries
+├── domain/repository/SlaTransitionFetchRepository   the SKIP LOCKED fetch of due rows
+├── domain/repository/OnTimeStepFetchRepository      the SKIP LOCKED sweep for MET
 ├── web/controller/IntelligenceEventLogController
 ├── web/DtoMapper, web/dto/
 └── config/  KafkaConfig (produce-only), ObservabilityConfig

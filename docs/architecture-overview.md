@@ -39,9 +39,9 @@ Deploy **last**. Table ownership and the full ordering rationale:
 ## 3. The fetch-and-apply cycle
 
 Every cycle runs **two independent sweeps**. The first fetches a batch of
-`step_sla_state_transition` rows that are ready to be processed and applies them; that is where a
-breach is detected. The second sweeps `step_instance` for steps that beat their due date and records
-them as `MET`.
+`step_sla_state_transition` rows whose deadline has passed and applies them; that is where a breach is
+detected. The second sweeps `step_instance` for steps that beat their due date and records them as
+`MET`.
 
 They are separate because they answer different questions from different evidence. A breach is a
 schedule's business — it happens at a deadline, so a row has to come round. Whether work was recorded
@@ -49,23 +49,15 @@ schedule's business — it happens at a deadline, so a row has to come round. Wh
 sweep therefore runs whether or not the first found anything, and a failure in one does not stop the
 other.
 
-Read the two fetches in the diagram as **independent queries, not a pipeline**. They read disjoint sets
-of rows and neither one uses the other's results. They run one after the other only because they share a
-single batch: the first takes what it needs, the second asks for whatever room is left. Nothing in the
-second query depends on *what* the first found — only on *how many*.
+Read them as **two sweeps, not two stages**. They query different tables, neither uses the other's
+results, and they run one after the other only because a single thread drives both. The order carries no
+more meaning than "a breach is the more pressing news".
 
 ```mermaid
 flowchart TD
-    S["Scheduled poll<br/>every cce.sla.poll-interval-ms"] --> D
-
-    subgraph FETCH["Fetch — two independent queries sharing one batch"]
-        direction TB
-        D["1 · FetchDueTransitions(now, batchSize)<br/>rows whose deadline has passed"]
-        C["2 · FetchLateStepTransitions(now, room left)<br/>rows whose step is already OVERDUE"]
-        D -->|"then — no rows handed over,<br/>only the unused batch room"| C
-    end
-
-    C --> E{"any rows fetched?"}
+    S["Scheduled poll<br/>every cce.sla.poll-interval-ms"]
+      --> D["FetchDueTransitions(now, batchSize)<br/>rows whose deadline has passed"]
+    D --> E{"any rows fetched?"}
     E -->|"none"| Z["sweep ends — one empty query"]
     E -->|"some"| A["apply each row<br/>same transaction as the fetch"]
     A --> F{"batch full?"}
@@ -97,8 +89,10 @@ the step itself is the work item. That is the simplification driving off the ste
 has to carry every `sla_status` transition and a set update would leave a gap exactly where a step went
 on time.
 
-Both queries live on `SlaTransitionFetchRepository`, and both return transition rows rather than steps
-— which is what the names say.
+The two fetches live on separate repositories — `SlaTransitionFetchRepository` and
+`OnTimeStepFetchRepository` — and both are kept out of cce-common-util's shared read side deliberately.
+Fetching rows to act on, and the pessimistic lock that comes with it, is this service's alone; the
+shared repositories are the read side another service could reach for.
 
 ### Step by step
 
@@ -106,48 +100,34 @@ Both queries live on `SlaTransitionFetchRepository`, and both return transition 
 service. `poll()` catches everything `evaluateDue()` throws, because an exception escaping a
 `@Scheduled` method stops the schedule. Every replica runs its own timer.
 
-**1 · `fetchDueTransitions(now, batchSize)`** — fetches rows where `processed = false AND next_attempt_at <=
-now`, ordered by `process_by`, under `FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2`
-timeout hint Hibernate translates to `SKIP LOCKED`). The predicate selects on `next_attempt_at` rather
-than `process_by`: the two are equal when the Matcher Service writes the row, and a failure pushes
-`next_attempt_at` out so a retry is deferred without rewriting `process_by`, which stays the immutable
-record of when the deadline fell. The partial index `idx_sslt_due` covers exactly this predicate, so the
-scan touches only the unprocessed backlog.
+**`fetchDueTransitions(now, batchSize)`** — the only query that brings a transition row in. Fetches rows
+where `is_processed = false AND next_attempt_at <= now`, ordered by `process_by`, under
+`FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2` timeout hint Hibernate translates to
+`SKIP LOCKED`). The predicate selects on `next_attempt_at` rather than `process_by`: the two are equal
+when the Matcher Service writes the row, and a failure pushes `next_attempt_at` out so a retry is
+deferred without rewriting `process_by`, which stays the immutable record of when the deadline fell. The
+partial index `idx_sslt_due` covers exactly this predicate, so the scan touches only the unprocessed
+backlog.
 
 Note what it does *not* read: this is a single-table query with no join to `step_instance`, so it knows
 nothing about whether the step completed. Eligibility here is purely "this row's gate has passed"; what
 the row *means* is decided later, in the apply.
 
-**2 · `fetchLateStepTransitions(now, room left)`** — runs only if the first query left room in the
-batch, and asks for exactly that much. It fetches rows whose step is already `COMPLETED` with a
-`completed_at` and an `sla_status` of `OVERDUE`, and excludes the rows the first query already takes
-(`next_attempt_at > now`) — which is what keeps the two sets disjoint. A step marked `COMPLETED` with no
-`completed_at` is invisible here and reachable only through the first query.
-
-**Why only `OVERDUE`.** A step still at null needs nothing from this query. If it beat its due date, the
-on-time sweep records `MET` and takes it out of the set; if it did not, its due-date row is already past
-and query 1 has it. What remains is a step already judged late, whose `MISSED_DATE_REACHED` row is the
-last one it holds — taken now rather than left pending against a date that can only confirm what is
-known.
-
-**And what it can actually record: nothing, in the ordinary case.** `completed_at` is clamped to `now`
-when a step completes, and a row that has never been attempted has `process_by == next_attempt_at`,
-which this query requires to be in the future. So `completed_at < process_by` always holds, the
-threshold is kept, and the row is consumed. Its job is to close out the step's schedule, not to reach a
-verdict. The exception is a row inside a back-off window, where `next_attempt_at` was pushed out while
-`process_by` stayed put and may now be past — there a breach is reachable.
-
-**any rows fetched?** — the size of the two results combined. Zero is the steady state: one empty
-indexed query per interval, and the cycle ends.
+**any rows fetched?** — zero is the steady state: one empty indexed query per interval, and the cycle
+ends.
 
 **apply each row** — per row: increment `attempts` (past five, the row is logged as an error every cycle
 rather than failing quietly), load the step, decide whether the threshold was breached, write
 `sla_status` forward-only, record the deviation if there is one, mirror the write into
 `step_instance_history`, and mark the row processed with `processed_by`. §4 covers the judgement itself.
-This is where `completed_at` is read, and it is one code path with no branch on which query fetched the
-row — which is why applying a row early and applying it late give the same verdict. Each fetched id is
-also appended to a list the evaluator holds — plain memory rather than transactional state, so it
-survives a rollback and the failure path knows which rows to defer.
+Each fetched id is also appended to a list the evaluator holds — plain memory rather than transactional
+state, so it survives a rollback and the failure path knows which rows to defer.
+
+`next_attempt_at` appears nowhere in that judgement. It is a fetch gate and nothing else — outside the
+fetch predicate the only code that touches it is `backOff`, which writes it and never reads it. What
+the apply reads is `transition_type` and `process_by` from the row, both immutable, and `step_status`,
+`completed_at`, `sla_status` and `required_behavior` from the step. So *when* a row is applied cannot
+change what it decides.
 
 **batch full?** — a result that came back the full `cce.sla.batch-size` means there is probably more, so
 the loop fetches again within the same cycle; a short batch means the backlog is drained.
@@ -177,26 +157,58 @@ interval. `MAX_BATCHES_PER_CYCLE` (100) stops a pathological backlog from monopo
 `ORDER BY process_by ASC` means the oldest deadline is always handled first, so a backlog degrades by
 latency rather than by dropping the most overdue work.
 
-### Two reasons a row is ready to process
+The on-time sweep has two steps of its own:
 
-A row's deadline passing is one. The other is its step already being `COMPLETED` with a `completed_at`:
-a breach is decided by comparing that timestamp against the row's `process_by` and never consults the
-clock, so once the completion is recorded the outcome is fixed and the schedule coming round later
-would only confirm it. Applying it now is the same verdict, sooner — and for a step recorded late, that
-is `OVERDUE` weeks before its deadline would have said so.
+**`fetchOnTimeSteps(batchSize)`** — a single-table read of `step_instance`, no join and no schedule
+consulted: `step_status = COMPLETED AND sla_status IS NULL AND completed_at < due_date`, with both
+timestamps required non-null, ordered by `completed_at` so the longest-waiting step is recorded first.
+It takes the same `FOR UPDATE SKIP LOCKED` as the transition fetch, so every replica can sweep the
+table at once and one that dies mid-batch releases its rows immediately.
 
-It also drains rows that will never record anything. A step that beat its deadline has no breach to
-detect, so its rows are consumed rather than left sitting as backlog on a step whose `MET` the other
-sweep has already recorded.
+Each predicate is load-bearing. `COMPLETED`, because only recorded work can have been on time.
+`sla_status IS NULL`, because that is the whole of the sweep's bookkeeping — and because `MET` is
+written over a null and nothing else, so a step already judged is not this sweep's to relabel.
+`completed_at < due_date` strictly, because that comparison *is* the question, and work landing exactly
+on the deadline did not beat it. And `due_date IS NOT NULL`, which excludes a step created from its own
+trigger: it has no deadline to have beaten, so its `sla_status` stays null.
 
-The two queries are disjoint (`next_attempt_at > now` on the second), so no row is applied twice, and
-they share the batch: deadline-driven rows first, the second query asking only for the room left. A full
-first batch skips the second query entirely — fallen deadlines are the pressing work, and the evaluator
-comes back for the rest in the next cycle.
+The query reads the null half of `idx_step_instance_completed_unjudged`, whose partial predicate spans
+both unsettled statuses (`sla_status IS NULL OR sla_status = 'OVERDUE'`). Only the null half has a
+consumer, so the `OVERDUE` half is dead weight the shared schema could drop. Either way the scan covers
+the completed-but-unsettled set rather than every step ever created, and a step matches at most once —
+the `MET` it gets is what removes it from the set, and a sweep empties what has accumulated.
 
-The second query is cheap because `idx_step_instance_completed_unjudged` covers exactly the
-completed-but-unsettled set, which a sweep empties. Driving it the other way — scanning pending
-transitions and checking each step — would mean walking the entire future schedule every few seconds.
+Driving it the other way — scanning pending `DUE_DATE_REACHED` rows and checking each step — would mean
+walking the entire future schedule every few seconds to find the few steps that finished early.
+
+**write `MET` on each** — per step: `sla_status = MET` and the matching `step_instance_history` row,
+through the same forward-only `writeSlaStatus` every other write goes through. No deviation is
+recorded, so nothing here reaches the intelligence evaluation of §5 — there is nothing deviant about
+on-time work. A step that somehow arrives already settled has its write refused and is counted
+consumed rather than applied.
+
+The step's own pending `DUE_DATE_REACHED` row is left alone. It is fetched when its schedule comes
+round, finds the step settled, and is consumed then. It stays out of the backlog gauge in the meantime,
+because that gauge counts only rows whose `next_attempt_at` has passed.
+
+### One gate, and what follows from it
+
+A row becomes ready when `next_attempt_at` passes. That is the whole of it — there is no second way in,
+and nothing pulls a step's remaining rows forward because the step completed or was judged.
+
+So a settled step keeps its unspent schedule until those dates arrive. A step recorded `MET` by the
+on-time sweep, or `OVERDUE` by its own due-date row, still holds a pending `MISSED_DATE_REACHED` row; it
+is fetched when its date comes round, finds the threshold kept or the status already past it, records
+nothing, and is consumed. The row is disposed of late rather than early, and the step's `sla_status` is
+the same either way.
+
+**Why not fetch a settled step's rows early?** Because it would buy nothing and cost the retry
+contract. A row's verdict is a function of `process_by` and the step's own columns, so taking one ahead
+of its deadline produces exactly the outcome the deadline would have produced later — the write moves
+earlier, nothing else changes. And a query for such rows has to ask for `next_attempt_at > now`, which
+is precisely the state `backOff` puts a failed row into: it would re-fetch on the next cycle a row the
+back-off had just deferred, so the exponential interval would never take effect for the rows it covered.
+One gate, honoured, is both simpler and more correct.
 
 ### Why a driver and an applier
 
@@ -241,7 +253,9 @@ different owners, and only `due_date` is a statement about the work.
 
 A step whose row no longer exists is consumed rather than retried: there is no schedule left to honour.
 A step marked `COMPLETED` with no `completed_at` is treated as a breach — the row is better evidence
-than a missing timestamp, and letting it pass would hide the gap instead of surfacing it.
+than a missing timestamp, and letting it pass would hide the gap instead of surfacing it. That rule
+needs no clock to justify it: a row is only ever applied once its own threshold has passed, so a step
+recorded complete with no timestamp is late by definition.
 
 ### Keeping a threshold is not the same as meeting an SLA
 
@@ -294,6 +308,10 @@ backoff write runs `REQUIRES_NEW`, because the transaction it is recovering from
 back — joining it would roll the backoff back too, and the row would be retried immediately in a tight
 loop.
 
+Nothing re-fetches a deferred row ahead of its `next_attempt_at`, so the interval the backoff computes
+is the interval that actually elapses. A second fetch path that reached rows by their step's state would
+quietly undo that, because a deferred row is exactly a row whose `next_attempt_at` is in the future.
+
 `processed_by` records which replica applied each row, so a misbehaving instance is identifiable from
 the data.
 
@@ -316,18 +334,17 @@ consumed.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `cce.sla.transitions.due` | gauge | rows the next cycle would fetch: past their deadline, or belonging to an already-`OVERDUE` step — the primary health signal |
+| `cce.sla.transitions.due` | gauge | rows the next cycle would fetch: unprocessed, with `next_attempt_at` already passed — the primary health signal |
 | `cce.sla.steps.on-time-unsettled` | gauge | completed steps that beat their due date and have not been recorded `MET` yet — on-time work awaiting acknowledgement, not lateness |
-| `cce.sla.transitions.applied` | counter | transitions that advanced a step's SLA |
+| `cce.sla.transitions.applied` | counter | `sla_status` writes that advanced a step — a transition row's breach, or the on-time sweep's `MET` |
 | `cce.sla.transitions.consumed` | counter | rows closed without recording a deviation — the event beat the deadline, the step was an exempt optional miss, or the SLA had already advanced |
 | `cce.sla.evaluator.cycles` | counter | polling cycles run |
 | `cce.sla.evaluator.batches.failed` | counter | batches that rolled back and were backed off |
 
-The gauge counts only what is **ready to process** — it carries both fetch predicates, counted by two queries
-and added. A gauge over every unprocessed row would fold in the entire future schedule, so it would
-track enrolment volume rather than lateness and could never sit near zero. Two queries rather than one
-`OR`: the branches read different indexes, and an `OR` across them plans as a sequential scan of the
-whole pending schedule on every scrape.
+The gauge counts only what is **ready to process** — it carries `fetchDueTransitions`'s own predicate,
+so it reports what the next cycle will actually take. A gauge over every unprocessed row would fold in
+the entire future schedule, so it would track enrolment volume rather than lateness and could never sit
+near zero.
 
 The gauge is the one to alert on. It sits near zero in a steady state and rises when transitions fall
 due faster than they are applied — which is the failure this service can actually have. A sustained

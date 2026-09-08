@@ -55,8 +55,8 @@ Gradle composite build assumes.
         ▼                                   ▼
   1. breach sweep                     2. on-time sweep
   step_sla_state_transition           step_instance
-  deadline passed, or step            COMPLETED, sla_status NULL,
-  already OVERDUE                     completed_at < due_date
+  is_processed = false,               COMPLETED, sla_status NULL,
+  next_attempt_at <= now              completed_at < due_date
         │                                   │
         ▼                                   ▼
   SlaTransitionApplier                write MET
@@ -77,11 +77,10 @@ what stops an early completion reading as null until its due date, weeks away.
 The row lock **is** what reserves the row — no lease table, no heartbeat, no leader election. Every replica can
 poll the same table concurrently, and a replica that dies mid-batch releases its rows immediately.
 
-A row is fetched either because its schedule came round or because its step is already `OVERDUE`, and
-what it decides is a breach: `completed_at` against its `process_by`, never the wall clock. `MET` is
-not a row's to decide — the on-time sweep settles that from the step's own `completed_at` and
-`due_date`, so an early completion is recorded without waiting for a deadline that would only confirm
-it. Details in
+A row is fetched for one reason — its schedule came round — and what it decides is a breach:
+`completed_at` against its `process_by`, never the wall clock. `MET` is not a row's to decide — the
+on-time sweep settles that from the step's own `completed_at` and `due_date`, so an early completion is
+recorded without waiting for a deadline that would only confirm it. Details in
 [Architecture §3](docs/architecture-overview.md#3-the-fetch-and-apply-cycle).
 
 ## API
@@ -96,7 +95,7 @@ Read-only. Everything this service writes is driven by its scheduler, never by a
 ## Testing
 
 ```bash
-./gradlew test              # 54 tests (53 unit + a context-boot test)
+./gradlew test              # 67 tests (66 unit + a context-boot test)
 ./gradlew build             # tests + coverage gate (0.98 instruction coverage)
 ./gradlew jacocoTestReport  # build/reports/jacoco/test/html/index.html
 ```
