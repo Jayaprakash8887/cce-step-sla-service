@@ -2,7 +2,7 @@ name: SonarQube
 
 on:
   push:
-    # Pattern, not a fixed list: release-1.0.0, release-2.0.0 and any future
+    # Pattern, not a fixed list: release-2.0.0, release-2.0.0 and any future
     # release line are covered without editing this file. Case-sensitive.
     # 'main' is the repository default branch and is listed so pushes there are
     # not silently skipped, even though the release lines carry the work.
