@@ -115,6 +115,85 @@ Produce-only. One topic:
 No consumer group, no DLQ, no inbound topic. If you find a consumer group named after this service on
 the broker, it is a leftover from the pre-split monolith and can be deleted.
 
+## Event Replay — sequencing the two services
+
+**Event Replay** is any run where the Matcher Service has a backlog of events on `cce.events.inbound`
+to work through: events re-published after a fix, a historical backfill during migration, or a long
+outage that left its consumer group far behind.
+
+**This service must be stopped for the duration.** Running it against an unmatched backlog makes it
+record `OVERDUE` and `MISSED` against steps whose completing event has not been processed yet — and
+neither those verdicts nor the clinician alerts they trigger can be withdrawn. The mechanism, and why
+stopping costs nothing, is in
+[Architecture — Operational prerequisite](architecture-overview.md#operational-prerequisite--event-replay).
+
+### Procedure
+
+**1. Stop this service.**
+
+```bash
+kubectl scale deployment/cce-compliance-service --replicas=0
+```
+
+There is no in-process pause switch — the `@Scheduled` poll has no guard — so scaling to zero (or
+stopping the container) is the only way to hold the sweep.
+
+**2. Let the Matcher Service drain.** Watch its consumer group until every partition reads `LAG 0`:
+
+```bash
+kafka-consumer-groups.sh --bootstrap-server "$BROKER" \
+  --group cce-matcher-service --describe
+```
+
+The group commits offsets only after a record has been processed (`enable-auto-commit: false`), so
+`LAG 0` means the database writes for those events are committed — not merely that the records were
+read. Wait a few minutes at zero before continuing; a late burst is easy to miss.
+
+**3. Start this service.**
+
+```bash
+kubectl scale deployment/cce-compliance-service --replicas=1
+```
+
+**4. Watch the drain.** `cce.sla.transitions.due` starts high — every deadline that fell during the
+replay is due at once — and should fall towards zero within a few cycles, with
+`cce.sla.evaluator.batches.failed` flat. Batches drain within a cycle, so even a large backlog clears
+in minutes rather than one batch per poll interval.
+
+### If the sequence was missed
+
+There is no automatic correction, and it is worth being blunt about what that means:
+
+| Already written | Recoverable? |
+|---|---|
+| `sla_status` = `OVERDUE` / `MISSED` on a step that was on time | Only by a manual data fix — the service will not revise it, since writes are forward-only and `MET` is written only over a null |
+| The `OVERDUE` / `MISSED` deviation row | Only by deleting it manually |
+| The intelligence event on `cce.intelligence.triggers` | **No.** It has been delivered |
+
+This query finds the affected steps — ones whose recorded breach disagrees with the `completed_at`
+that arrived afterwards:
+
+```sql
+SELECT s.id, s.action_id, s.sla_status, s.completed_at,
+       t.transition_type, t.process_by, t.processed_at
+FROM step_instance s
+JOIN step_sla_state_transition t ON t.step_instance_id = s.id
+WHERE s.step_status = 'COMPLETED'
+  AND t.is_processed = true
+  AND ( (s.sla_status = 'OVERDUE' AND t.transition_type = 'DUE_DATE_REACHED')
+     OR (s.sla_status = 'MISSED'  AND t.transition_type = 'MISSED_DATE_REACHED') )
+  AND s.completed_at < t.process_by
+ORDER BY t.processed_at DESC;
+```
+
+Pairing each status with the row that produced it is what keeps the result clean: without it, a step
+legitimately `OVERDUE` for completing late would also match, because its missed-date row was kept.
+
+A row here means the verdict was reached before the completion was known. It is not proof of a missed
+Event Replay — any backdated event arriving after its deadline produces the same shape — but after a
+replay this is the list to work from. What to do about an alert already sent is a clinical call, not a
+technical one.
+
 ## Health checks & monitoring
 
 | Endpoint | Use |
@@ -161,6 +240,7 @@ This service owns no tables, so there is nothing here to back up. `step_sla_stat
 | `cycles` not incrementing | Scheduler stopped; restart the pod. Liveness will not detect this |
 | Deviations recorded but no intelligence delivered | Check `?published=false` on the [read API](api-reference.md#get-v1complianceintelligence-events) — the trigger may be built but unconfirmed |
 | The same alert delivered repeatedly | A transition retrying against an already-recorded deviation should be de-duplicated ([Architecture §5](architecture-overview.md#5-intelligence-on-deviation)); check `attempts` on the row |
+| A completed step is `OVERDUE` / `MISSED` although its `completed_at` beat the threshold | The row was judged before the Matcher Service had matched the completing event — the [Event Replay](#event-replay--sequencing-the-two-services) sequence was not held. Not self-correcting |
 | A step's `sla_status` looks wrong for a completed step | This service is its **only** writer — Matcher records `step_status` and `completed_at` and never judges timeliness. Compare `completed_at` against the row's `process_by` ([Architecture §4](architecture-overview.md#4-what-the-applier-does)) |
 | A completed step stays at a null `sla_status` | It has no `due_date`, so nothing judges it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |
 | A settled step still has an unprocessed `MISSED_DATE_REACHED` row | Expected, not a stuck row. A row is taken when its own deadline arrives, so a step completed before its missed date keeps that row until the date passes — then it is consumed and records nothing |

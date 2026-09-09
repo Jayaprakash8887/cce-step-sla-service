@@ -10,6 +10,65 @@ only what is specific to this service.
 
 ---
 
+## Operational prerequisite — Event Replay
+
+**This service must not run while the Matcher Service still has an event backlog to process.** Stop it
+for the duration, and start it again only once that backlog is drained.
+
+**Event Replay** is the term for any such run: events re-published to `cce.events.inbound` after a fix,
+a historical backfill during migration, or a restart that leaves the Matcher Service far behind on its
+consumer group. Use that term when coordinating — it is what this constraint is called.
+
+Running both at once costs nothing in throughput. What it produces is **wrong verdicts that cannot be
+withdrawn**.
+
+### Why it matters
+
+This service concludes that work has not happened by finding no completion on `step_instance`. That
+inference is only sound once every event that could have completed the step has been matched. While
+events sit unprocessed in Kafka, an absent completion does not mean the work was not done — it means
+the Matcher Service has not reached it yet.
+
+During an Event Replay the two do not merely race occasionally; they collide by default:
+
+1. **Deadlines are anchored to clinical time, not to now.** The Matcher Service computes a step's
+   `due_date` from the occurrence time of the event that triggered it, and writes `process_by` and
+   `next_attempt_at` from that. Replaying a month-old event therefore creates a transition row whose
+   deadline has *already passed* — so it is eligible on the very next poll, seconds later.
+2. This service fetches that row, finds `step_status` is not `COMPLETED`, and writes `OVERDUE` (or
+   `MISSED`) with a matching deviation — the first and fourth rows of the table in
+   [§4](#4-what-the-applier-does).
+3. The completing event is still in the backlog. When the Matcher Service reaches it, it sets
+   `completed_at` to that event's own clinical timestamp — which is often *earlier* than `process_by`,
+   meaning the work was in fact done on time.
+4. **Nothing corrects step 2**, and each reason is deliberate:
+   - `sla_status` writes are forward-only, and `MET` is written only over a null, so a step recorded
+     `OVERDUE` can never become `MET`.
+   - The on-time sweep considers only steps with `sla_status IS NULL`, so it never revisits this one.
+   - The deviation row already exists and is de-duplicated, so it is not reconsidered.
+   - The intelligence actions already fired and were published to `cce.intelligence.triggers`. **A
+     clinician has already been alerted.**
+
+That last point is what makes this a prerequisite rather than a preference. A wrong `sla_status` and a
+spurious deviation can in principle be repaired by a data fix; a delivered alert cannot be recalled.
+
+### Why stopping is safe
+
+Nothing is lost by holding this service off. That is not luck — it follows from the design:
+
+- Transition rows are durable and are never cancelled, and `process_by` is immutable.
+- The judgement never consults the wall clock, so a row applied hours or days late reaches **exactly**
+  the verdict it would have reached on time. See [One gate](#one-gate-and-what-follows-from-it).
+- `ORDER BY process_by ASC` takes the oldest deadline first, and batches drain within a cycle rather
+  than one batch per interval, so a backlog accumulated during the replay clears in minutes.
+
+The only cost of stopping is detection latency — nothing is judged while it is down. The cost of not
+stopping is a permanently wrong clinical record.
+
+The runbook — how to stop it, how to tell the Matcher Service is caught up, how to verify the drain,
+and what to do if the sequence was missed — is in the
+[Deployment Guide](deployment-guide.md#event-replay--sequencing-the-two-services).
+
 ## 1. Responsibility
 
 Everything the schedule drives — and the one verdict that needs no schedule at all:

@@ -9,6 +9,13 @@ publishes the intelligence actions the deviations trigger.
 It matches no events, enrols no patients and manages no definitions. It **owns no tables** and runs no
 migrations. Kafka is **produce-only** — nothing inbound reaches this service.
 
+> **Before you run it during an Event Replay: don't.** This service must be stopped while the Matcher
+> Service still has an event backlog to process, or it will record `OVERDUE` and `MISSED` against steps
+> whose completing event has not been matched yet — verdicts and clinician alerts that cannot be
+> withdrawn. Why:
+> [Architecture — Operational prerequisite](docs/architecture-overview.md#operational-prerequisite--event-replay).
+> Runbook: [Deployment Guide](docs/deployment-guide.md#event-replay--sequencing-the-two-services).
+
 **Port** `8092` · **Java** 21 · **Spring Boot** 3.4.2 · **Version** 2.0.0
 
 ## Quick Start
