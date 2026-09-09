@@ -1,9 +1,10 @@
 # CCE Compliance Service
 
 The time plane of the CCE system. Picks up the SLA transitions the Matcher Service scheduled as their
-deadlines pass, writes `step_instance.sla_status` (it is the column's only writer), records the
-resulting `OVERDUE` / `MISSED`
-deviations, and publishes the intelligence actions they trigger.
+deadlines pass and records the resulting `OVERDUE` / `MISSED` deviations; separately sweeps
+`step_instance` for completed steps that beat their `due_date` and records those as `MET`, needing no
+schedule to do it. It writes `step_instance.sla_status` — it is the column's only writer — and
+publishes the intelligence actions the deviations trigger.
 
 It matches no events, enrols no patients and manages no definitions. It **owns no tables** and runs no
 migrations. Kafka is **produce-only** — nothing inbound reaches this service.

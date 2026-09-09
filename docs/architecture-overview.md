@@ -1,6 +1,7 @@
 # Architecture & Design — Compliance Service
 
-> The time plane: what happens because a deadline passed, not because an event arrived.
+> The time plane: what happens because a deadline passed or was beaten — never because an event
+> arrived.
 
 System-wide context — why the services are split, the shared schema, the SLA handoff contract — lives
 in the **cce-common-util** repository's
@@ -11,12 +12,20 @@ only what is specific to this service.
 
 ## 1. Responsibility
 
-Everything driven by **time passing**:
+Everything the schedule drives — and the one verdict that needs no schedule at all:
 
-1. Pick up the `step_sla_state_transition` rows the Matcher Service scheduled, once they fall due.
-2. Write `step_instance.sla_status` — this service is its only writer.
-3. Record the resulting `OVERDUE` / `MISSED` deviations.
-4. Evaluate the intelligence actions those deviations trigger, and publish them.
+1. Pick up the `step_sla_state_transition` rows the Matcher Service scheduled, once they fall due, and
+   judge whether each threshold was breached.
+2. Sweep `step_instance` for completed steps that beat their `due_date`, with no row involved.
+3. Write `step_instance.sla_status` — `OVERDUE` and `MISSED` from (1), `MET` from (2). This service is
+   its only writer.
+4. Record the resulting `OVERDUE` / `MISSED` deviations. On-time work breached nothing and records none.
+5. Evaluate the intelligence actions those deviations trigger, and publish them.
+
+The split between (1) and (2) is the shape of the whole service. A breach is measured against a
+schedule, so a row has to come round for it. Timeliness is a statement about the step, answerable from
+its own `completed_at` and `due_date` as soon as the completion lands — no threshold need fall for
+`MET` to be known. §3 is how both are driven.
 
 It also exposes a read API over `intelligence_event_log`.
 
