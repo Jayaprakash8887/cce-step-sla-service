@@ -1,4 +1,4 @@
-# CCE Compliance Service
+# CCE Step SLA Service
 
 The time plane of the CCE system. Picks up the SLA transitions the Matcher Service scheduled as their
 deadlines pass and records the resulting `OVERDUE` / `MISSED` deviations; separately sweeps
@@ -94,8 +94,8 @@ recorded without waiting for a deadline that would only confirm it. Details in
 ## API
 
 ```
-GET /v1/compliance/intelligence-events?protocolInstanceId=&actionDefinitionId=&published=
-GET /v1/compliance/intelligence-events/{id}
+GET /v1/sla/intelligence-events?protocolInstanceId=&actionDefinitionId=&published=
+GET /v1/sla/intelligence-events/{id}
 ```
 
 Read-only. Everything this service writes is driven by its scheduler, never by a request.

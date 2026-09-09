@@ -1,4 +1,4 @@
-# Developer Setup — Compliance Service
+# Developer Setup — Step SLA Service
 
 ## Prerequisites
 
@@ -61,7 +61,7 @@ time.
 ## Project layout
 
 ```
-org.openphc.cce.compliance
+org.openphc.cce.sla
 ├── service/SlaTransitionEvaluator   @Scheduled driver — polls, loops, holds no transaction
 ├── service/SlaTransitionApplier     the @Transactional boundary — fetch and apply
 ├── service/IntelligenceEventLogService
@@ -92,7 +92,7 @@ The driver/applier split is not stylistic — see
 ./gradlew jacocoTestReport
 ```
 
-The coverage gate is **0.98** instruction coverage, excluding `ComplianceServiceApplication`.
+The coverage gate is **0.98** instruction coverage, excluding `StepSlaServiceApplication`.
 
 `ApplicationContextTest` boots the real context on H2 with Flyway disabled and the poll interval widened so the sweep does not repeat. It is
 the only test that exercises the wiring: everything else constructs its subject directly, which leaves a

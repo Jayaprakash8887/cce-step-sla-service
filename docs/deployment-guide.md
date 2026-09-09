@@ -1,4 +1,4 @@
-# Deployment Guide — Compliance Service
+# Deployment Guide — Step SLA Service
 
 Deploy **last**. This service creates no tables and validates its JPA mapping at startup, so it will
 fail fast against a `ccedb` the other two services have not yet migrated. Ordering rationale:
@@ -41,18 +41,18 @@ misbehaving replica.
 context:
 
 ```bash
-cd ..            # the directory containing cce-compliance-service and cce-common-util
-docker build -f cce-compliance-service/Dockerfile -t cce-compliance-service:2.0.0 .
+cd ..            # the directory containing cce-step-sla-service and cce-common-util
+docker build -f cce-step-sla-service/Dockerfile -t cce-step-sla-service:2.0.0 .
 ```
 
 ```bash
-docker run -d --name cce-compliance-service \
+docker run -d --name cce-step-sla-service \
   -p 8092:8080 \
   -e DB_HOST=postgres-host -e DB_PORT=5433 \
   -e DB_USERNAME=cce_user -e DB_PASSWORD='<secret>' \
   -e KAFKA_BOOTSTRAP_SERVERS=kafka-host:9092 \
-  -e CCE_SLA_INSTANCE_ID=compliance-1 \
-  cce-compliance-service:2.0.0
+  -e CCE_SLA_INSTANCE_ID=step-sla-1 \
+  cce-step-sla-service:2.0.0
 ```
 
 The image pins `SERVER_PORT=8080` to match its `EXPOSE` and healthcheck; the application's own default
@@ -64,18 +64,18 @@ outside Docker is `8092`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: cce-compliance-service
+  name: cce-step-sla-service
 spec:
   replicas: 2
   selector:
-    matchLabels: { app: cce-compliance-service }
+    matchLabels: { app: cce-step-sla-service }
   template:
     metadata:
-      labels: { app: cce-compliance-service }
+      labels: { app: cce-step-sla-service }
     spec:
       containers:
-        - name: cce-compliance-service
-          image: cce-compliance-service:2.0.0
+        - name: cce-step-sla-service
+          image: cce-step-sla-service:2.0.0
           ports: [{ containerPort: 8080 }]
           env:
             - name: CCE_SLA_INSTANCE_ID
@@ -132,7 +132,7 @@ stopping costs nothing, is in
 **1. Stop this service.**
 
 ```bash
-kubectl scale deployment/cce-compliance-service --replicas=0
+kubectl scale deployment/cce-step-sla-service --replicas=0
 ```
 
 There is no in-process pause switch — the `@Scheduled` poll has no guard — so scaling to zero (or
@@ -152,7 +152,7 @@ read. Wait a few minutes at zero before continuing; a late burst is easy to miss
 **3. Start this service.**
 
 ```bash
-kubectl scale deployment/cce-compliance-service --replicas=1
+kubectl scale deployment/cce-step-sla-service --replicas=1
 ```
 
 **4. Watch the drain.** `cce.sla.transitions.due` starts high — every deadline that fell during the
@@ -238,7 +238,7 @@ This service owns no tables, so there is nothing here to back up. `step_sla_stat
 | `due` gauge rising, `cycles` incrementing | Sweep running but not keeping up — add replicas or raise `batch-size` |
 | `due` rising, `batches.failed` rising | Rows failing and backing off; check the logs for the rolled-back batch |
 | `cycles` not incrementing | Scheduler stopped; restart the pod. Liveness will not detect this |
-| Deviations recorded but no intelligence delivered | Check `?published=false` on the [read API](api-reference.md#get-v1complianceintelligence-events) — the trigger may be built but unconfirmed |
+| Deviations recorded but no intelligence delivered | Check `?published=false` on the [read API](api-reference.md#get-v1slaintelligence-events) — the trigger may be built but unconfirmed |
 | The same alert delivered repeatedly | A transition retrying against an already-recorded deviation should be de-duplicated ([Architecture §5](architecture-overview.md#5-intelligence-on-deviation)); check `attempts` on the row |
 | A completed step is `OVERDUE` / `MISSED` although its `completed_at` beat the threshold | The row was judged before the Matcher Service had matched the completing event — the [Event Replay](#event-replay--sequencing-the-two-services) sequence was not held. Not self-correcting |
 | A step's `sla_status` looks wrong for a completed step | This service is its **only** writer — Matcher records `step_status` and `completed_at` and never judges timeliness. Compare `completed_at` against the row's `process_by` ([Architecture §4](architecture-overview.md#4-what-the-applier-does)) |

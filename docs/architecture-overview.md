@@ -1,4 +1,4 @@
-# Architecture & Design — Compliance Service
+# Architecture & Design — Step SLA Service
 
 > The time plane: what happens because a deadline passed or was beaten — never because an event
 > arrived.

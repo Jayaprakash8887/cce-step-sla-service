@@ -1,4 +1,4 @@
-# API Reference — Compliance Service
+# API Reference — Step SLA Service
 
 Base URL: `http://<host>:8092`
 
@@ -12,12 +12,12 @@ Error bodies and status codes come from the shared `GlobalExceptionHandler`:
 
 ## Intelligence events
 
-`/v1/compliance/intelligence-events`
+`/v1/sla/intelligence-events`
 
 A record of every intelligence action evaluated — what fired, why, against which step, and whether the
 trigger reached the broker.
 
-### `GET /v1/compliance/intelligence-events`
+### `GET /v1/sla/intelligence-events`
 
 Paged. Standard Spring `Pageable` (`?page=0&size=20&sort=createdAt,desc`).
 
@@ -35,7 +35,7 @@ error. Combine filters client-side if you need an intersection.
 `?published=false` is the operationally interesting one: it lists intelligence that was evaluated and
 should have been delivered but was not confirmed by Kafka. Those rows are the replay candidates.
 
-### `GET /v1/compliance/intelligence-events/{id}`
+### `GET /v1/sla/intelligence-events/{id}`
 
 One event. `404` if no such id.
 
