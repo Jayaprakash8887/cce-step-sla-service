@@ -10,7 +10,6 @@ fail fast against a `ccedb` the other two services have not yet migrated. Orderi
 |---|---|
 | JRE | 21 |
 | PostgreSQL | 16, database `ccedb` — schema already applied by the Protocol and Matcher services |
-| Kafka | producer only — `cce.intelligence.triggers` must exist or be auto-creatable |
 | Memory | 1 GB heap is comfortable |
 
 The database user needs **no DDL rights**. If it has them, that is a wider grant than this service
@@ -25,7 +24,6 @@ production:
 |---|---|---|
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | |
 | `DB_USERNAME` / `DB_PASSWORD` | `cce_user` / `cce_pass` | never leave at the default |
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | |
 | `CCE_SLA_INSTANCE_ID` | `$HOSTNAME` | **set this per replica** — it lands in `processed_by` |
 | `CCE_SLA_POLL_INTERVAL_MS` | `5000` | |
 | `CCE_SLA_BATCH_SIZE` | `100` | |
@@ -50,7 +48,6 @@ docker run -d --name cce-step-sla-service \
   -p 8092:8080 \
   -e DB_HOST=postgres-host -e DB_PORT=5433 \
   -e DB_USERNAME=cce_user -e DB_PASSWORD='<secret>' \
-  -e KAFKA_BOOTSTRAP_SERVERS=kafka-host:9092 \
   -e CCE_SLA_INSTANCE_ID=step-sla-1 \
   cce-step-sla-service:2.0.0
 ```
@@ -84,8 +81,6 @@ spec:
               value: postgres.cce.svc.cluster.local
             - { name: DB_USERNAME, valueFrom: { secretKeyRef: { name: cce-db, key: username } } }
             - { name: DB_PASSWORD, valueFrom: { secretKeyRef: { name: cce-db, key: password } } }
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              value: kafka.cce.svc.cluster.local:9092
           readinessProbe:
             httpGet: { path: /actuator/health/readiness, port: 8080 }
             initialDelaySeconds: 20
@@ -106,14 +101,9 @@ database-bound, and a backlog is visible in that gauge long before it shows up a
 
 ## Kafka
 
-Produce-only. One topic:
-
-| Topic | Direction |
-|---|---|
-| `cce.intelligence.triggers` | produce |
-
-No consumer group, no DLQ, no inbound topic. If you find a consumer group named after this service on
-the broker, it is a leftover from the pre-split monolith and can be deleted.
+None. This service neither consumes nor produces: no topic, no consumer group, no DLQ. If you find a
+consumer group named after this service on the broker, it is a leftover from the pre-split monolith and
+can be deleted.
 
 ## Event Replay — sequencing the two services
 
@@ -123,7 +113,7 @@ outage that left its consumer group far behind.
 
 **This service must be stopped for the duration.** Running it against an unmatched backlog makes it
 record `OVERDUE` and `MISSED` against steps whose completing event has not been processed yet — and
-neither those verdicts nor the clinician alerts they trigger can be withdrawn. The mechanism, and why
+the service never revises those verdicts. The mechanism, and why
 stopping costs nothing, is in
 [Architecture — Operational prerequisite](architecture-overview.md#operational-prerequisite--event-replay).
 
@@ -168,7 +158,6 @@ There is no automatic correction, and it is worth being blunt about what that me
 |---|---|
 | `sla_status` = `OVERDUE` / `MISSED` on a step that was on time | Only by a manual data fix — the service will not revise it, since writes are forward-only and `MET` is written only over a null |
 | The `OVERDUE` / `MISSED` deviation row | Only by deleting it manually |
-| The intelligence event on `cce.intelligence.triggers` | **No.** It has been delivered |
 
 This query finds the affected steps — ones whose recorded breach disagrees with the `completed_at`
 that arrived afterwards:
@@ -191,8 +180,7 @@ legitimately `OVERDUE` for completing late would also match, because its missed-
 
 A row here means the verdict was reached before the completion was known. It is not proof of a missed
 Event Replay — any backdated event arriving after its deadline produces the same shape — but after a
-replay this is the list to work from. What to do about an alert already sent is a clinical call, not a
-technical one.
+replay this is the list to work from.
 
 ## Health checks & monitoring
 
@@ -202,8 +190,8 @@ technical one.
 | `/actuator/health/liveness` | Restart decisions |
 | `/actuator/prometheus` | Scrape target |
 
-Note what readiness does **not** cover: the scheduler. A pod can be ready and serving the read API
-while its SLA sweep is stalled. The metrics to alert on are `cce.sla.transitions.due` and
+Note what readiness does **not** cover: the scheduler. A pod can report ready while its SLA
+sweep is stalled. The metrics to alert on are `cce.sla.transitions.due` and
 `cce.sla.steps.on-time-unsettled` — see
 [Architecture §6](architecture-overview.md#6-observability) for how to read them alongside
 `evaluator.cycles` and `batches.failed`.
@@ -227,8 +215,8 @@ Suggested alerts:
 
 ## Backup
 
-This service owns no tables, so there is nothing here to back up. `step_sla_state_transition`,
-`deviation` and `intelligence_event_log` are covered by the Matcher Service's backup.
+This service owns no tables, so there is nothing here to back up. `step_sla_state_transition`
+and `deviation` are covered by the Matcher Service's backup.
 
 ## Troubleshooting
 
@@ -238,8 +226,6 @@ This service owns no tables, so there is nothing here to back up. `step_sla_stat
 | `due` gauge rising, `cycles` incrementing | Sweep running but not keeping up — add replicas or raise `batch-size` |
 | `due` rising, `batches.failed` rising | Rows failing and backing off; check the logs for the rolled-back batch |
 | `cycles` not incrementing | Scheduler stopped; restart the pod. Liveness will not detect this |
-| Deviations recorded but no intelligence delivered | Check `?published=false` on the [read API](api-reference.md#get-v1slaintelligence-events) — the trigger may be built but unconfirmed |
-| The same alert delivered repeatedly | A transition retrying against an already-recorded deviation should be de-duplicated ([Architecture §5](architecture-overview.md#5-intelligence-on-deviation)); check `attempts` on the row |
 | A completed step is `OVERDUE` / `MISSED` although its `completed_at` beat the threshold | The row was judged before the Matcher Service had matched the completing event — the [Event Replay](#event-replay--sequencing-the-two-services) sequence was not held. Not self-correcting |
 | A step's `sla_status` looks wrong for a completed step | This service is its **only** writer — Matcher records `step_status` and `completed_at` and never judges timeliness. Compare `completed_at` against the row's `process_by` ([Architecture §4](architecture-overview.md#4-what-the-applier-does)) |
 | A completed step stays at a null `sla_status` | It has no `due_date`, so nothing judges it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |

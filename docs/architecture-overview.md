@@ -46,11 +46,10 @@ During an Event Replay the two do not merely race occasionally; they collide by 
      `OVERDUE` can never become `MET`.
    - The on-time sweep considers only steps with `sla_status IS NULL`, so it never revisits this one.
    - The deviation row already exists and is de-duplicated, so it is not reconsidered.
-   - The intelligence actions already fired and were published to `cce.intelligence.triggers`. **A
-     clinician has already been alerted.**
 
-That last point is what makes this a prerequisite rather than a preference. A wrong `sla_status` and a
-spurious deviation can in principle be repaired by a data fix; a delivered alert cannot be recalled.
+What makes this a prerequisite rather than a preference is that nothing notices. A wrong verdict is not
+an error the service reports — it is an ordinary-looking `sla_status` and deviation, and undoing it is
+a manual data fix against every affected step.
 
 ### Why stopping is safe
 
@@ -79,18 +78,17 @@ Everything the schedule drives — and the one verdict that needs no schedule at
 3. Write `step_instance.sla_status` — `OVERDUE` and `MISSED` from (1), `MET` from (2). This service is
    its only writer.
 4. Record the resulting `OVERDUE` / `MISSED` deviations. On-time work breached nothing and records none.
-5. Evaluate the intelligence actions those deviations trigger, and publish them.
 
 The split between (1) and (2) is the shape of the whole service. A breach is measured against a
 schedule, so a row has to come round for it. Timeliness is a statement about the step, answerable from
 its own `completed_at` and `due_date` as soon as the completion lands — no threshold need fall for
 `MET` to be known. §3 is how both are driven.
 
-It also exposes a read API over `intelligence_event_log`.
-
-**What it does not do**: match inbound events, enrol patients, create or complete steps, or manage
-definitions. It has no Kafka consumer — nothing inbound reaches it. `ORDER_VIOLATION` deviations stay
-with the Matcher Service, which detects them at completion from the event itself.
+**What it does not do**: match inbound events, enrol patients, create or complete steps, manage
+definitions, or evaluate intelligence actions on the deviations it records
+([§5](#5-intelligence-on-deviation)). It uses no Kafka — nothing inbound reaches it and it publishes
+nothing. `ORDER_VIOLATION` deviations stay with the Matcher Service, which detects them at completion
+from the event itself.
 
 ## 2. Owns no tables
 
@@ -251,9 +249,8 @@ walking the entire future schedule every few seconds to find the few steps that 
 
 **write `MET` on each** — per step: `sla_status = MET` and the matching `step_instance_history` row,
 through the same forward-only `writeSlaStatus` every other write goes through. No deviation is
-recorded, so nothing here reaches the intelligence evaluation of §5 — there is nothing deviant about
-on-time work. A step that somehow arrives already settled has its write refused and is counted
-consumed rather than applied.
+recorded — there is nothing deviant about on-time work. A step that somehow arrives already settled
+has its write refused and is counted consumed rather than applied.
 
 The step's own pending `DUE_DATE_REACHED` row is left alone. It is fetched when its schedule comes
 round, finds the step settled, and is consumed then. It stays out of the backlog gauge in the meantime,
@@ -385,18 +382,15 @@ the data.
 
 ## 5. Intelligence on deviation
 
-When a deviation is newly recorded — not when it already existed — the shared
-[`IntelligenceActionEvaluator`](../../cce-common-util/docs/library-reference.md#intelligence--intelligenceactionevaluator)
-evaluates the step's intelligence actions and publishes any that fire to
-`cce.intelligence.triggers`.
+Not part of this service yet. A breach records its deviation ([§4](#4-what-the-applier-does)) and
+nothing further happens: no intelligence action is evaluated and nothing is published.
 
-The de-duplication matters: without it, a transition retried after a failure would re-trigger an alert
-a clinician has already received. `DeviationRecorder` reports whether the row was new, and the
-evaluation is gated on that.
-
-This service is **produce-only** on Kafka. Its `KafkaConfig` declares a producer factory, a template
-and the outbound topic — no consumer factory, no listener container, no DLQ, because nothing is
-consumed.
+cce-common-util still ships that machinery — `IntelligenceActionEvaluator` and the Kafka producer it
+publishes through — so the application class keeps it out explicitly. It filters the library's
+`intelligence` and `kafka` packages from component scanning, and excludes Kafka auto-configuration
+because spring-kafka still reaches the classpath through that library. Without both, those beans would
+be created anyway, with a Kafka producer to back them. `ApplicationContextTest` fails if either
+exclusion is lost.
 
 ## 6. Observability
 
@@ -438,6 +432,7 @@ time.
 
 ## 8. Security
 
-No authentication at the application layer; the read API is expected to sit behind the gateway
-service. The service performs no writes on behalf of a caller — every write it makes is driven by the
-scheduler, from rows another service created.
+No authentication at the application layer, and no application API: the only HTTP surface is
+actuator's health and metrics endpoints, which should not be exposed beyond the cluster. The service
+performs no writes on behalf of a caller — every write it makes is driven by the scheduler, from rows
+another service created.

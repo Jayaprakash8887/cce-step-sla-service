@@ -10,7 +10,6 @@ import org.openphc.cce.common.enums.SlaTransitionType;
 import org.openphc.cce.common.enums.StepStatus;
 import org.openphc.cce.common.repository.StepInstanceRepository;
 import org.openphc.cce.common.deviation.DeviationRecorder;
-import org.openphc.cce.common.intelligence.IntelligenceActionEvaluator;
 import org.openphc.cce.common.history.StateTransitionHistoryWriter;
 import org.openphc.cce.sla.domain.repository.OnTimeStepFetchRepository;
 import org.openphc.cce.sla.domain.repository.SlaTransitionFetchRepository;
@@ -110,7 +109,6 @@ public class SlaTransitionApplier {
     private final OnTimeStepFetchRepository onTimeStepRepository;
     private final StepInstanceRepository stepInstanceRepository;
     private final DeviationRecorder deviationRecorder;
-    private final IntelligenceActionEvaluator intelligenceActionEvaluator;
     private final StateTransitionHistoryWriter stateTransitionHistoryWriter;
     private final String instanceId;
     private final int batchSize;
@@ -122,7 +120,6 @@ public class SlaTransitionApplier {
                                 OnTimeStepFetchRepository onTimeStepRepository,
                                 StepInstanceRepository stepInstanceRepository,
                                 DeviationRecorder deviationRecorder,
-                                IntelligenceActionEvaluator intelligenceActionEvaluator,
                                 StateTransitionHistoryWriter stateTransitionHistoryWriter,
                                 @Value("${cce.sla.instance-id:${HOSTNAME:local}}") String instanceId,
                                 @Value("${cce.sla.batch-size:100}") int batchSize,
@@ -132,7 +129,6 @@ public class SlaTransitionApplier {
         this.onTimeStepRepository = onTimeStepRepository;
         this.stepInstanceRepository = stepInstanceRepository;
         this.deviationRecorder = deviationRecorder;
-        this.intelligenceActionEvaluator = intelligenceActionEvaluator;
         this.stateTransitionHistoryWriter = stateTransitionHistoryWriter;
         this.instanceId = instanceId;
         this.batchSize = batchSize;
@@ -341,18 +337,15 @@ public class SlaTransitionApplier {
 
     /**
      * The deviation a breach produces: the due date an {@code OVERDUE}, the missed date a
-     * {@code MISSED}. Intelligence is evaluated only for a freshly created deviation, so a re-fetched
-     * row cannot publish the same intelligence event twice.
+     * {@code MISSED}. {@link DeviationRecorder} de-duplicates on the step and type, so a re-fetched row
+     * cannot record the same deviation twice.
      */
     private void raiseDeviationFor(StepSlaStateTransition row, StepInstance step) {
         DeviationType type = row.getTransitionType() == SlaTransitionType.DUE_DATE_REACHED
                 ? DeviationType.OVERDUE
                 : DeviationType.MISSED;
 
-        DeviationRecorder.DeviationResult result = deviationRecorder.recordDeviation(step, type);
-        if (result.created()) {
-            intelligenceActionEvaluator.evaluateOnDeviation(step, result.deviation());
-        }
+        deviationRecorder.recordDeviation(step, type);
     }
 
     private void markProcessed(StepSlaStateTransition row) {

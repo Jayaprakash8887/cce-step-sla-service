@@ -17,7 +17,6 @@ import org.openphc.cce.common.enums.SlaTransitionType;
 import org.openphc.cce.common.enums.StepStatus;
 import org.openphc.cce.common.repository.StepInstanceRepository;
 import org.openphc.cce.common.deviation.DeviationRecorder;
-import org.openphc.cce.common.intelligence.IntelligenceActionEvaluator;
 import org.openphc.cce.common.history.StateTransitionHistoryWriter;
 import org.openphc.cce.sla.domain.repository.OnTimeStepFetchRepository;
 import org.openphc.cce.sla.domain.repository.SlaTransitionFetchRepository;
@@ -46,7 +45,6 @@ class SlaTransitionApplierTest {
     @Mock private OnTimeStepFetchRepository onTimeStepRepository;
     @Mock private StepInstanceRepository stepInstanceRepository;
     @Mock private DeviationRecorder deviationRecorder;
-    @Mock private IntelligenceActionEvaluator intelligenceActionEvaluator;
     @Mock private StateTransitionHistoryWriter stateTransitionHistoryWriter;
 
     private SlaTransitionApplier applier;
@@ -55,7 +53,7 @@ class SlaTransitionApplierTest {
     @BeforeEach
     void setUp() {
         applier = new SlaTransitionApplier(transitionRepository, onTimeStepRepository, stepInstanceRepository,
-                deviationRecorder, intelligenceActionEvaluator, stateTransitionHistoryWriter,
+                deviationRecorder, stateTransitionHistoryWriter,
                 "test-instance", 100, 3600, new SimpleMeterRegistry());
     }
 
@@ -359,7 +357,7 @@ class SlaTransitionApplierTest {
 
         private SlaTransitionApplier applierWithBatchSize(int batchSize) {
             return new SlaTransitionApplier(transitionRepository, onTimeStepRepository, stepInstanceRepository,
-                    deviationRecorder, intelligenceActionEvaluator, stateTransitionHistoryWriter,
+                    deviationRecorder, stateTransitionHistoryWriter,
                     "test-instance", batchSize, 3600, new SimpleMeterRegistry());
         }
     }
@@ -456,20 +454,6 @@ class SlaTransitionApplierTest {
 
     @Nested
     class Bookkeeping {
-
-        @Test
-        void duplicateDeviation_doesNotRepublishIntelligence() {
-            StepInstance step = step(StepStatus.NOT_STARTED, null, "must", null);
-            StepSlaStateTransition row = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusMinutes(1));
-            fetch(row, step);
-            when(deviationRecorder.recordDeviation(any(), any())).thenReturn(
-                    new DeviationRecorder.DeviationResult(
-                            Deviation.builder().id(UUID.randomUUID()).build(), false));
-
-            applier.fetchAndApply(new ArrayList<>());
-
-            verify(intelligenceActionEvaluator, never()).evaluateOnDeviation(any(), any());
-        }
 
         @Test
         void missingStep_consumesTheRowRatherThanRetryingForever() {

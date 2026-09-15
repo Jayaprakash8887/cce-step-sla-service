@@ -6,7 +6,6 @@
 |---|---|
 | JDK 21 | Gradle toolchain |
 | PostgreSQL 16 | shared `ccedb` — **must already contain the schema** (see below) |
-| Kafka | producer only |
 | `cce-common-util` | checked out as a sibling directory — wired in as a composite build |
 
 This service **owns no tables and runs no migrations**, so it cannot bring up its own schema. Start
@@ -18,7 +17,7 @@ migrations on startup. Starting this service against a schema-less database fail
 
 ```bash
 # 1. Shared infrastructure
-cd ../cce-collector-service && docker compose up -d postgres kafka
+cd ../cce-collector-service && docker compose up -d postgres kafka   # Kafka is for the Matcher Service
 
 # 2. Schema — from the two services that own it, in this order
 cd ../cce-protocol-service && ./gradlew bootRun   # creates 4 tables
@@ -39,13 +38,10 @@ curl -s localhost:8092/actuator/health
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | `5433` for the collector's shared instance |
 | `DB_NAME` | `ccedb` | |
 | `DB_USERNAME` / `DB_PASSWORD` | `cce_user` / `cce_pass` | needs **no** DDL rights |
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | |
 | `CCE_SLA_POLL_INTERVAL_MS` | `5000` | how often to look for due transitions |
 | `CCE_SLA_BATCH_SIZE` | `100` | rows fetched per transaction |
 | `CCE_SLA_INSTANCE_ID` | `$HOSTNAME` | recorded in `processed_by` |
 | `CCE_SLA_MAX_BACKOFF_SECONDS` | `3600` | cap on the `2^attempts` retry backoff |
-| `CCE_PARSED_PROTOCOL_CACHE_SIZE` | `256` | shared parsed-protocol cache |
-| `CCE_PUBLISH_CONFIRM_TIMEOUT_MS` | `5000` | how long to wait for a broker ack before recording the trigger unpublished |
 
 ### Tuning the sweep
 
@@ -64,17 +60,19 @@ time.
 org.openphc.cce.sla
 ├── service/SlaTransitionEvaluator   @Scheduled driver — polls, loops, holds no transaction
 ├── service/SlaTransitionApplier     the @Transactional boundary — fetch and apply
-├── service/IntelligenceEventLogService
 ├── domain/repository/SlaTransitionFetchRepository   the SKIP LOCKED fetch of due rows
 ├── domain/repository/OnTimeStepFetchRepository      the SKIP LOCKED sweep for MET
-├── web/controller/IntelligenceEventLogController
-├── web/DtoMapper, web/dto/
-└── config/  KafkaConfig (produce-only), ObservabilityConfig
+└── config/ObservabilityConfig
 ```
 
-Entities, repositories, `DeviationRecorder` and `IntelligenceActionEvaluator` come from
+Entities, repositories, `DeviationRecorder` and `StateTransitionHistoryWriter` come from
 `cce-common-util`. What this service adds is the fetch queries, the transaction boundary and the
 scheduler.
+
+It does not take everything that library contributes. The application class filters common-util's
+`intelligence` and `kafka` packages out of component scanning and excludes Kafka auto-configuration:
+those beans would otherwise be created regardless, and `IntelligenceActionEvaluator` brings a Kafka
+producer with it. `ApplicationContextTest` fails if either exclusion is lost.
 
 `build.gradle` reflects that: it declares no FHIR, JSONLogic or Flyway dependency of its own. The FHIR
 layer arrives transitively through `cce-common-util`, and Flyway would be dead weight in a service that
@@ -87,7 +85,7 @@ The driver/applier split is not stylistic — see
 ## Testing
 
 ```bash
-./gradlew test              # 54 tests — 53 unit plus one context-boot test
+./gradlew test              # 46 tests — 44 unit plus two context-boot tests
 ./gradlew build             # tests + coverage gate
 ./gradlew jacocoTestReport
 ```
@@ -105,11 +103,6 @@ wrong is a failure to start.
 There is no integration-test source set. The behaviour that would justify one — concurrent fetches
 across replicas — cannot be reproduced against H2, because `FOR UPDATE SKIP LOCKED` semantics are the
 thing under test. Verify that against real PostgreSQL.
-
-Controller tests build MockMvc with `MockMvcBuilders.standaloneSetup` rather than `@WebMvcTest`,
-because the application class carries `@EnableJpaRepositories` and a web slice would fail looking for
-an `entityManagerFactory`. They register a `PageableHandlerMethodArgumentResolver` explicitly, since
-standalone setup does not supply one.
 
 ## Working on the applier
 

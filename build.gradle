@@ -26,25 +26,24 @@ repositories {
 }
 
 dependencies {
-    // Shared vocabulary, Kafka contracts and FHIR parsing/evaluation.
+    // Shared entities and repositories, and the deviation and history writers the applier uses.
     implementation 'org.openphc.cce:cce-common-util'
 
     // Spring Boot starters.
-    // starter-web serves the intelligence-event read endpoint plus actuator's /actuator/health
-    // (container HEALTHCHECK and Kubernetes probes) and /actuator/prometheus.
+    // starter-web serves actuator's /actuator/health (container HEALTHCHECK and Kubernetes probes) and
+    // /actuator/prometheus. There is no application API.
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
-    implementation 'org.springframework.kafka:spring-kafka'
 
     // Database. No Flyway: this service owns no tables and runs with flyway.enabled=false, so a
     // migration dependency here would only invite it to start writing DDL it does not own.
     runtimeOnly 'org.postgresql:postgresql'
 
     // No FHIR or JSONLogic declarations. This service parses no PlanDefinitions and evaluates no
-    // expressions of its own — it reaches FHIR only through cce-common-util's cache and evaluator, and
-    // that library brings hapi-fhir, johnzon, jakarta.json, hapi-fhir-caching-caffeine and org.fhir:ucum
-    // with it. Redeclaring them here would only be a second version to keep in step.
+    // expressions. cce-common-util still brings hapi-fhir, johnzon, jakarta.json,
+    // hapi-fhir-caching-caffeine and org.fhir:ucum with it, and its FHIR beans still start; redeclaring
+    // them here would only be a second version to keep in step.
 
     // Observability
     implementation 'io.micrometer:micrometer-registry-prometheus'
@@ -55,7 +54,6 @@ dependencies {
 
     // Testing
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
-    testImplementation 'org.springframework.kafka:spring-kafka-test'
     testCompileOnly 'org.projectlombok:lombok'
     testAnnotationProcessor 'org.projectlombok:lombok'
 

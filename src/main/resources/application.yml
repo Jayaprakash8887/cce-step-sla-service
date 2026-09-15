@@ -41,32 +41,8 @@ spring:
   flyway:
     enabled: false
 
-  # --- Kafka ---
-  # Produce-only. This service consumes nothing, so there is no consumer or listener configuration
-  # here and KafkaConfig declares no listener container factory.
-  kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-    producer:
-      acks: all
-      retries: 3
-      properties:
-        enable.idempotence: true
-        max.in.flight.requests.per.connection: 5
-
-# --- Custom Kafka Topics ---
+# --- SLA sweep ---
 cce:
-  kafka:
-    topics:
-      intelligence-triggers: cce.intelligence.triggers
-      default-partitions: 25
-    # No cce.kafka.retry.* here: retry and DLQ settings govern a consumer, and this service has none.
-  protocol:
-    # Read by the shared ParsedProtocolCache, which intelligence evaluation uses to resolve a step's
-    # metadata from its protocol definition.
-    parsed-cache-size: ${CCE_PARSED_PROTOCOL_CACHE_SIZE:256}
-  intelligence:
-    # How long to wait for Kafka to acknowledge an intelligence trigger before recording it unpublished
-    publish-confirm-timeout-ms: ${CCE_PUBLISH_CONFIRM_TIMEOUT_MS:5000}
   sla:
     # The evaluator fetches step_sla_state_transition rows with FOR UPDATE SKIP LOCKED, so every replica
     # can poll concurrently. This interval is the steady-state cost — one empty fetch query per tick; a
@@ -97,7 +73,6 @@ management:
 logging:
   level:
     root: INFO
-    org.apache.kafka: WARN
     org.hibernate: WARN
     org.openphc.cce.sla: INFO
 

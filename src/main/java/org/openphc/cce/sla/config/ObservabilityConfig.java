@@ -14,7 +14,7 @@ import java.time.ZoneOffset;
  * Metrics for the time plane.
  *
  * <p>The counters this service moves are registered where they are incremented
- * ({@code cce.sla.transitions.*}, {@code cce.sla.evaluator.*}, {@code cce.intelligence.actions.*}). What
+ * ({@code cce.sla.transitions.*}, {@code cce.sla.evaluator.*}). What
  * belongs here is the one thing only a gauge can express: how much due work is still outstanding.
  *
  * <p>{@code cce.sla.steps.on-time-unsettled} is the second: steps that beat their due date and are
