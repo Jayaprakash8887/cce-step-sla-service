@@ -114,10 +114,12 @@ Four invariants to preserve:
 2. **Judge against `completed_at`, never the wall clock.** The row was fetched because its deadline
    passed; the only remaining question is whether the work had happened by then, and the clinical
    occurrence time is the evidence for that.
-3. **Write `MET` only on the `DUE_DATE_REACHED` row, and only over a null.** Beating the missed date
-   means the step was not written off, not that it was on time — a step completed between its two
-   thresholds is `OVERDUE`, and `writeSlaStatus`'s forward-only rule is what keeps a retry applying
-   rows out of order from walking that back.
+3. **Write `MET` only from the on-time sweep, and only over a null.** No transition row writes `MET`:
+   a row decides breaches, and keeping a threshold is not being on time — a step completed between its
+   two thresholds stays `OVERDUE`. `MET` comes from `fetchAndSettleOnTime`, measured as
+   `completed_at < due_date` on the step itself, and `writeSlaStatus` refuses it over any existing
+   judgement. The same forward-only rule keeps a retry applying rows out of order from walking
+   `MISSED` back to `OVERDUE`.
 4. **Keep the `MISSED` status and deviation `must`-only on every path.** `isOptionalMiss` is
    deliberately shared by the completed and outstanding paths. Applying the exemption to only one would
    make an optional step recorded late worse off than one never recorded at all.
