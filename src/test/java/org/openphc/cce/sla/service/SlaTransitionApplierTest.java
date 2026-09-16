@@ -26,7 +26,6 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -460,12 +459,36 @@ class SlaTransitionApplierTest {
             StepInstance step = step(StepStatus.NOT_STARTED, null, "must", null);
             StepSlaStateTransition row = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusMinutes(1));
             when(transitionRepository.fetchDueTransitions(any(), any())).thenReturn(List.of(row));
-            when(stepInstanceRepository.findById(step.getId())).thenReturn(Optional.empty());
+            when(stepInstanceRepository.findAllById(List.of(step.getId()))).thenReturn(List.of());
 
             applier.fetchAndApply(new ArrayList<>());
 
             assertTrue(row.isProcessed());
             verify(deviationRecorder, never()).recordDeviation(any(), any());
+        }
+
+        @Test
+        void aBatchLoadsItsStepsInOneQuery_andBothOfAStepsRowsJudgeTheSameInstance() {
+            // A step's two thresholds can fall due in the same batch. They are loaded with the rest of
+            // the batch in a single query rather than one per row, and both rows see the same instance,
+            // so the missed-date row judges the step the due-date row has just written OVERDUE.
+            StepInstance step = step(StepStatus.NOT_STARTED, null, "must", null);
+            StepSlaStateTransition dueRow = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusHours(2));
+            StepSlaStateTransition missedRow = row(step, SlaTransitionType.MISSED_DATE_REACHED, now.minusMinutes(1));
+            when(transitionRepository.fetchDueTransitions(any(), any())).thenReturn(List.of(dueRow, missedRow));
+            when(stepInstanceRepository.findAllById(List.of(step.getId()))).thenReturn(List.of(step));
+            freshDeviation();
+
+            int count = applier.fetchAndApply(new ArrayList<>());
+
+            assertEquals(2, count);
+            verify(stepInstanceRepository, times(1)).findAllById(anyIterable());
+            verify(stepInstanceRepository, never()).findById(any());
+            assertEquals(SlaStatus.MISSED, step.getSlaStatus());
+            verify(deviationRecorder).recordDeviation(step, DeviationType.OVERDUE);
+            verify(deviationRecorder).recordDeviation(step, DeviationType.MISSED);
+            assertTrue(dueRow.isProcessed());
+            assertTrue(missedRow.isProcessed());
         }
 
         @Test
@@ -498,7 +521,7 @@ class SlaTransitionApplierTest {
 
     private void fetch(StepSlaStateTransition row, StepInstance step) {
         when(transitionRepository.fetchDueTransitions(any(), any())).thenReturn(List.of(row));
-        when(stepInstanceRepository.findById(step.getId())).thenReturn(Optional.of(step));
+        when(stepInstanceRepository.findAllById(List.of(step.getId()))).thenReturn(List.of(step));
     }
 
     private void freshDeviation() {

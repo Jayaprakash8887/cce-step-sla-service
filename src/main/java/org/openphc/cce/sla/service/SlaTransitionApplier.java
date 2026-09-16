@@ -25,7 +25,10 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Fetches due {@code step_sla_state_transition} rows and applies them.
@@ -157,25 +160,51 @@ public class SlaTransitionApplier {
     @Transactional
     public int fetchAndApply(List<UUID> fetched) {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-        List<StepSlaStateTransition> batch = transitionRepository.fetchDueTransitions(now, Limit.of(batchSize));
+        List<StepSlaStateTransition> dueRows = transitionRepository.fetchDueTransitions(now, Limit.of(batchSize));
+        Map<UUID, StepInstance> stepsById = loadStepsFor(dueRows);
 
-        for (StepSlaStateTransition row : batch) {
+        for (StepSlaStateTransition row : dueRows) {
             fetched.add(row.getId());
             row.setAttempts(row.getAttempts() + 1);
             if (row.getAttempts() > ATTEMPTS_BEFORE_ALERT) {
                 log.error("SLA transition {} for step {} has now been attempted {} times",
                         row.getId(), row.getStepInstanceId(), row.getAttempts());
             }
-            applyRow(row);
+            applyRow(row, stepsById.get(row.getStepInstanceId()));
         }
-        return batch.size();
+        return dueRows.size();
     }
 
-    private void applyRow(StepSlaStateTransition row) {
-        StepInstance step = stepInstanceRepository.findById(row.getStepInstanceId()).orElse(null);
+    /**
+     * Every step the batch judges, in one query.
+     *
+     * <p>Fetching each row's step as the row is applied would be a query per row — a hundred round
+     * trips for a hundred-row batch, all inside the transaction holding the row locks. One
+     * {@code IN (…)} instead, before the loop, so the cost of a batch is two queries however large
+     * {@code batch-size} grows.
+     *
+     * <p>Ids are de-duplicated because a step's two thresholds can fall due in the same batch; both rows
+     * then see the same managed instance, so a status written by the first is visible to the second.
+     */
+    private Map<UUID, StepInstance> loadStepsFor(List<StepSlaStateTransition> rows) {
+        if (rows.isEmpty()) {
+            return Map.of();
+        }
+        List<UUID> stepIds = rows.stream()
+                .map(StepSlaStateTransition::getStepInstanceId)
+                .distinct()
+                .toList();
+        return stepInstanceRepository.findAllById(stepIds).stream()
+                .collect(Collectors.toMap(StepInstance::getId, Function.identity()));
+    }
+
+    private void applyRow(StepSlaStateTransition row, StepInstance step) {
         if (step == null) {
-            // The step is gone, so there is no schedule left to honour. Close the row rather than
-            // retrying something that can never succeed.
+            // Unreachable while the schema holds: step_instance_id is NOT NULL and carries a foreign key
+            // to step_instance(id), with no cascade, so the database refuses to leave a row without its
+            // step. Kept because the alternative to a guard here is a NullPointerException on every
+            // cycle: a row whose step is somehow gone can never succeed, so consume it rather than
+            // retry it forever.
             log.warn("SLA transition {} references step {} which no longer exists — consuming",
                     row.getId(), row.getStepInstanceId());
             markProcessed(row);
@@ -267,8 +296,8 @@ public class SlaTransitionApplier {
      */
     @Transactional
     public int fetchAndSettleOnTime(List<UUID> fetched) {
-        List<StepInstance> batch = onTimeStepRepository.fetchOnTimeSteps(Limit.of(batchSize));
-        for (StepInstance step : batch) {
+        List<StepInstance> onTimeSteps = onTimeStepRepository.fetchOnTimeSteps(Limit.of(batchSize));
+        for (StepInstance step : onTimeSteps) {
             fetched.add(step.getId());
             if (writeSlaStatus(step, SlaStatus.MET)) {
                 log.debug("Step {} beat its due date of {} — recorded MET",
@@ -277,7 +306,7 @@ public class SlaTransitionApplier {
                 consumedCounter.increment();
             }
         }
-        return batch.size();
+        return onTimeSteps.size();
     }
 
     /**
@@ -291,25 +320,38 @@ public class SlaTransitionApplier {
      *
      * @return whether the status was written
      */
-    private boolean writeSlaStatus(StepInstance step, SlaStatus target) {
-        SlaStatus current = step.getSlaStatus();
-        boolean allowed = target == SlaStatus.MET
-                ? current == null
-                : rank(target) > rank(current);
-        if (!allowed) {
-            log.debug("Step {} is already {} — not writing {}", step.getId(), current, target);
+    private boolean writeSlaStatus(StepInstance step, SlaStatus newStatus) {
+        SlaStatus currentStatus = step.getSlaStatus();
+        if (!canAdvance(currentStatus, newStatus)) {
+            log.debug("Step {} is already {} — not writing {}", step.getId(), currentStatus, newStatus);
             return false;
         }
 
-        step.setSlaStatus(target);
+        step.setSlaStatus(newStatus);
         stepInstanceRepository.save(step);
         stateTransitionHistoryWriter.recordStepInstanceTransition(
                 step, OffsetDateTime.now(ZoneOffset.UTC));
         appliedCounter.increment();
 
         log.info("Step {} (actionId={}) SLA {} -> {}",
-                step.getId(), step.getActionId(), current, target);
+                step.getId(), step.getActionId(), currentStatus, newStatus);
         return true;
+    }
+
+    /**
+     * Whether {@code newStatus} may replace what the step already has.
+     *
+     * <p>{@code MET} is written only from null. It says the step beat its due date, which a step some
+     * deadline has already judged cannot be told retrospectively.
+     *
+     * <p>Every other outcome moves forward only, so {@code OVERDUE} can never replace {@code MISSED} —
+     * which is exactly what two rows for one step applied out of order after a retry would otherwise do.
+     */
+    private static boolean canAdvance(SlaStatus currentStatus, SlaStatus newStatus) {
+        if (newStatus == SlaStatus.MET) {
+            return currentStatus == null;
+        }
+        return rank(newStatus) > rank(currentStatus);
     }
 
     /** Ordering for the forward-only rule. Null is "not yet judged", so it precedes every outcome. */
