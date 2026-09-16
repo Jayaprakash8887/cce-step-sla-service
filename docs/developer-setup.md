@@ -84,7 +84,7 @@ The driver/applier split is not stylistic — see
 ## Testing
 
 ```bash
-./gradlew test              # 46 tests — 44 unit plus two context-boot tests
+./gradlew test              # 44 tests — 42 unit plus two context-boot tests
 ./gradlew build             # tests + coverage gate
 ./gradlew jacocoTestReport
 ```
@@ -118,9 +118,9 @@ Four invariants to preserve:
    stays `OVERDUE`. `MET` is confirmed as `completed_at < due_date` on the step itself, not taken on
    the row's word, and `writeSlaStatus` refuses it over any existing judgement. The same forward-only
    rule keeps a retry applying rows out of order from walking `MISSED` back to `OVERDUE`.
-4. **Judge mandatory steps only.** A breach is a deadline missed, and only a step the protocol
-   required has one — so `applyBreach` consumes any row whose step is not `must`, on both the completed
-   and the outstanding path, writing neither status nor deviation. Matcher no longer schedules such a
+4. **Judge mandatory steps only.** Only a step the protocol required has a deadline — to breach or to
+   beat — so `applyRow` consumes any row whose step is not `must` before it looks at the row's type,
+   writing neither status nor deviation, `MET` included. Matcher no longer schedules such a
    step at all and the Protocol Service rejects a protocol that tries to give one a deadline; the check
    here is what covers the rows written before those rules. Use `RequiredBehavior.isMandatory` rather
    than comparing the string, so this service and the matcher cannot drift on what "optional" means.

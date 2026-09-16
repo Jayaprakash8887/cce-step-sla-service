@@ -72,7 +72,8 @@ import java.util.stream.Collectors;
  * mandatory step can breach one. Matcher schedules no row for an optional step, and a protocol that
  * gives an optional action a {@code tolerance-days} is rejected at load. A row for an optional step can
  * therefore only be one written before those rules — it is consumed, leaving no {@code sla_status} and
- * no deviation, whichever threshold it stands for. The table below describes mandatory steps.
+ * no deviation, whatever it stands for, {@code MET} included. Scheduling and judging enforce that
+ * separately, so neither alone has to be trusted. The table below describes mandatory steps.
  *
  * <table border="1">
  *   <caption>Behaviour by threshold and step state, for a mandatory step</caption>
@@ -148,7 +149,7 @@ public class SlaTransitionApplier {
                 .description("SLA transitions that wrote a step's sla_status")
                 .register(meterRegistry);
         this.skippedCounter = Counter.builder("cce.sla.transitions.skipped")
-                .description("Breached SLA transitions that recorded neither a status nor a deviation")
+                .description("SLA transitions that reached no verdict: an optional step's stale schedule, or a step already settled")
                 .register(meterRegistry);
     }
 
@@ -191,8 +192,9 @@ public class SlaTransitionApplier {
      * {@code IN (…)} instead, before the loop, so the cost of a batch is two queries however large
      * {@code batch-size} grows.
      *
-     * <p>Ids are de-duplicated because a step's two thresholds can fall due in the same batch; both rows
-     * then see the same managed instance, so a status written by the first is visible to the second.
+     * <p>Ids are de-duplicated because a step can have up to three rows — its two thresholds and its
+     * {@code MET_CONDITION_REACHED} — and they can come round in the same batch. They then all see the
+     * same managed instance, so a verdict written by the first is visible to the rest.
      */
     private Map<UUID, StepInstance> loadStepsFor(List<StepSlaStateTransition> rows) {
         if (rows.isEmpty()) {
@@ -215,6 +217,19 @@ public class SlaTransitionApplier {
             // retry it forever.
             log.warn("SLA transition {} references step {} which no longer exists — consuming",
                     row.getId(), row.getStepInstanceId());
+            markProcessed(row);
+            return;
+        }
+
+        if (!RequiredBehavior.isMandatory(step.getRequiredBehavior())) {
+            // Nothing was required of an optional step, so it has no deadline to breach and none to
+            // have beaten — no verdict of any kind is its to reach. Matcher schedules no row for one
+            // and a protocol that gives an optional action a deadline is rejected at load, so this row
+            // predates those rules: it is closed rather than retried, and leaves nothing behind.
+            skippedCounter.increment();
+            log.warn("Step {} is optional (requiredBehavior={}) — {} transition {} is a stale schedule "
+                            + "and records no status or deviation",
+                    step.getId(), step.getRequiredBehavior(), row.getTransitionType(), row.getId());
             markProcessed(row);
             return;
         }
@@ -286,18 +301,6 @@ public class SlaTransitionApplier {
 
     /** The deadline was not met: advance the SLA and record the deviation. */
     private void applyBreach(StepSlaStateTransition row, StepInstance step) {
-        if (!RequiredBehavior.isMandatory(step.getRequiredBehavior())) {
-            // Nothing was required of an optional step, so nothing was breached by its not happening.
-            // Matcher no longer schedules one at all, and a protocol that gives an optional action a
-            // deadline is now rejected at load — so this is a row written before those rules, kept
-            // judgeable only so it can be closed rather than retried. It leaves no verdict behind.
-            skippedCounter.increment();
-            log.warn("Step {} is optional (requiredBehavior={}) — transition {} is a stale schedule "
-                            + "and records no status or deviation",
-                    step.getId(), step.getRequiredBehavior(), row.getId());
-            return;
-        }
-
         if (!writeSlaStatus(step, row.getTransitionType().breachStatus())) {
             // Already at or past this outcome: a re-fetched row, or rows applied out of order.
             skippedCounter.increment();

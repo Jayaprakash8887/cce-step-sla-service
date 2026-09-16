@@ -363,6 +363,22 @@ class SlaTransitionApplierTest {
         }
 
         @Test
+        void aMetRowForAnOptionalStepRecordsNothing() {
+            // An optional step reaches no verdict at all — not MET either. Matcher writes no such row,
+            // so this one predates the rule, and the applier enforces it rather than trusting the row.
+            StepInstance step = step(StepStatus.COMPLETED, null, "could", now.minusHours(3));
+            step.setDueDate(now.plusDays(4));
+            StepSlaStateTransition row = row(step, SlaTransitionType.MET_CONDITION_REACHED, now.minusHours(3));
+            fetch(row, step);
+
+            applier.fetchAndApply(new ArrayList<>());
+
+            assertNull(step.getSlaStatus());
+            verify(stateTransitionHistoryWriter, never()).recordStepInstanceTransition(any(), any());
+            assertTrue(row.isProcessed());
+        }
+
+        @Test
         void aMetRowForAStepStillAwaitingItsEventRecordsNothing() {
             StepInstance step = step(StepStatus.NOT_STARTED, null, "must", null);
             step.setDueDate(now.plusDays(4));
@@ -506,9 +522,9 @@ class SlaTransitionApplierTest {
         }
 
         @Test
-        void aBatchLoadsItsStepsInOneQuery_andBothOfAStepsRowsJudgeTheSameInstance() {
-            // A step's two thresholds can fall due in the same batch. They are loaded with the rest of
-            // the batch in a single query rather than one per row, and both rows see the same instance,
+        void aBatchLoadsItsStepsInOneQuery_andAStepsRowsJudgeTheSameInstance() {
+            // A step's rows can come round in the same batch. They are loaded with the rest of the
+            // batch in a single query rather than one per row, and every row sees the same instance,
             // so the missed-date row judges the step the due-date row has just written OVERDUE.
             StepInstance step = step(StepStatus.NOT_STARTED, null, "must", null);
             StepSlaStateTransition dueRow = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusHours(2));
@@ -527,6 +543,31 @@ class SlaTransitionApplierTest {
             verify(deviationRecorder).recordDeviation(step, DeviationType.MISSED);
             assertTrue(dueRow.isProcessed());
             assertTrue(missedRow.isProcessed());
+        }
+
+        @Test
+        void allThreeOfAStepsRowsAreJudgedFromOneFetch() {
+            // The most a step can hold: both thresholds and its MET condition. Ordered by process_by,
+            // the MET row comes first — written at the completion, which is what beat the due date —
+            // and the two deadlines that follow find the step settled and record nothing.
+            StepInstance step = step(StepStatus.COMPLETED, null, "must", now.minusDays(2));
+            StepSlaStateTransition met = row(step, SlaTransitionType.MET_CONDITION_REACHED, now.minusDays(2));
+            StepSlaStateTransition due = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusHours(2));
+            StepSlaStateTransition missed = row(step, SlaTransitionType.MISSED_DATE_REACHED, now.minusHours(1));
+            when(transitionRepository.fetchTransitions(any(), any())).thenReturn(List.of(met, due, missed));
+            when(stepInstanceRepository.findAllById(List.of(step.getId()))).thenReturn(List.of(step));
+
+            int count = applier.fetchAndApply(new ArrayList<>());
+
+            assertEquals(3, count);
+            verify(stepInstanceRepository, times(1)).findAllById(anyIterable());
+            assertEquals(SlaStatus.MET, step.getSlaStatus());
+            verify(deviationRecorder, never()).recordDeviation(any(), any());
+            // One write, not three: the deadlines had nothing left to say about a settled step.
+            verify(stateTransitionHistoryWriter, times(1)).recordStepInstanceTransition(eq(step), any());
+            assertTrue(met.isProcessed());
+            assertTrue(due.isProcessed());
+            assertTrue(missed.isProcessed());
         }
 
         @Test

@@ -93,7 +93,7 @@ by a request.
 ## Testing
 
 ```bash
-./gradlew test              # 43 tests (41 unit + 2 context-boot tests)
+./gradlew test              # 44 tests (42 unit + 2 context-boot tests)
 ./gradlew build             # tests + coverage gate (0.98 instruction coverage)
 ./gradlew jacocoTestReport  # build/reports/jacoco/test/html/index.html
 ```

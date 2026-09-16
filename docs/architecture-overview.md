@@ -334,13 +334,14 @@ progressive instantiation, SLA scheduling and the judgement here, so a step cann
 rule and optional by the next.
 
 A row for an optional step can therefore only be one written before those rules. The applier **consumes
-it**, recording no `sla_status` and no deviation, whichever threshold it stands for, and logs it as a
-stale schedule. Neither `OVERDUE` nor `MISSED` is written: both are breaches, and there was nothing the
-step was required to do.
+it**, recording no `sla_status` and no deviation, whatever the row stands for, and logs it as a stale
+schedule. That check sits ahead of the type dispatch, so it covers `MET_CONDITION_REACHED` as well as
+the two deadlines: the rule is enforced where rows are written *and* where they are judged, so neither
+side alone has to be trusted.
 
 `MET` follows the same rule, now that it comes from a row too: Matcher writes no
-`MET_CONDITION_REACHED` for an optional step, so an optional step reaches no SLA verdict at all and its
-`sla_status` stays null. That is the consequence of having no deadline — there is no due date it can be
+`MET_CONDITION_REACHED` for an optional step and the applier would decline one anyway, so an optional
+step reaches no SLA verdict at all and its `sla_status` stays null. That is the consequence of having no deadline — there is no due date it can be
 said to have beaten, just as there is none it can breach.
 
 ### What it does not write
@@ -386,7 +387,7 @@ exclusion is lost.
 |---|---|---|
 | `cce.sla.transitions.due` | gauge | rows the next cycle would fetch: unprocessed, with `next_attempt_at` already passed — the primary health signal |
 | `cce.sla.transitions.applied` | counter | `sla_status` writes that advanced a step — a breach, or a completion confirmed `MET` |
-| `cce.sla.transitions.skipped` | counter | rows whose threshold **was** breached that still recorded nothing — an optional step's schedule predating the mandatory-only rule, or an SLA already at or past this outcome. An anomaly signal, so it sits near zero; a row consumed for the ordinary reason (the work beat its threshold) is not counted |
+| `cce.sla.transitions.skipped` | counter | rows that asked for a verdict and got none — an optional step's schedule predating the mandatory-only rule, or a step already settled. An anomaly signal, so it sits near zero; a deadline row consumed for the ordinary reason (the work beat its threshold) is not counted |
 | `cce.sla.evaluator.cycles` | counter | polling cycles run |
 | `cce.sla.evaluator.batches.failed` | counter | batches that rolled back and were backed off |
 

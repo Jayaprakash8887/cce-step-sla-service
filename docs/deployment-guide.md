@@ -16,6 +16,11 @@ fail fast against a `ccedb` the other two services have not yet migrated. Orderi
 >
 > Reverse the order and the old service jams on rows it cannot read. There is no version in which both
 > write `MET`, so there is no double-write to worry about either way.
+>
+> The same applies to **cce-compliance-service**, the 1.x service this one replaces: it maps the same
+> two transition types and would jam identically. It must be stopped before the new Matcher starts
+> writing `MET_CONDITION_REACHED` rows — which it should be regardless, since both services writing
+> `sla_status` is exactly what the 2.0.0 split ended.
 
 ## Requirements
 
