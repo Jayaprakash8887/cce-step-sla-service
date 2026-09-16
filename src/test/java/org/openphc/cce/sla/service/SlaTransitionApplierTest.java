@@ -18,7 +18,6 @@ import org.openphc.cce.common.enums.StepStatus;
 import org.openphc.cce.common.repository.StepInstanceRepository;
 import org.openphc.cce.common.deviation.DeviationRecorder;
 import org.openphc.cce.common.history.StateTransitionHistoryWriter;
-import org.openphc.cce.sla.domain.repository.OnTimeStepFetchRepository;
 import org.openphc.cce.sla.domain.repository.SlaTransitionFetchRepository;
 import org.springframework.data.domain.Limit;
 
@@ -41,7 +40,6 @@ import static org.mockito.Mockito.*;
 class SlaTransitionApplierTest {
 
     @Mock private SlaTransitionFetchRepository transitionRepository;
-    @Mock private OnTimeStepFetchRepository onTimeStepRepository;
     @Mock private StepInstanceRepository stepInstanceRepository;
     @Mock private DeviationRecorder deviationRecorder;
     @Mock private StateTransitionHistoryWriter stateTransitionHistoryWriter;
@@ -51,7 +49,7 @@ class SlaTransitionApplierTest {
 
     @BeforeEach
     void setUp() {
-        applier = new SlaTransitionApplier(transitionRepository, onTimeStepRepository, stepInstanceRepository,
+        applier = new SlaTransitionApplier(transitionRepository, stepInstanceRepository,
                 deviationRecorder, stateTransitionHistoryWriter,
                 "test-instance", 100, 3600, new SimpleMeterRegistry());
     }
@@ -94,7 +92,7 @@ class SlaTransitionApplierTest {
         @Test
         void missedDateReached_optional_recordsNeitherStatusNorDeviation() {
             // Nothing was required of an optional step, so nothing was breached by its not happening.
-            // It keeps the OVERDUE the due date gave it — being late is still a fact about it.
+            // Whatever status it already carries is left exactly as it is.
             StepInstance step = step(StepStatus.NOT_STARTED, SlaStatus.OVERDUE, "could", null);
             StepSlaStateTransition row = row(step, SlaTransitionType.MISSED_DATE_REACHED, now.minusMinutes(1));
             fetch(row, step);
@@ -102,6 +100,22 @@ class SlaTransitionApplierTest {
             applier.fetchAndApply(new ArrayList<>());
 
             assertEquals(SlaStatus.OVERDUE, step.getSlaStatus());
+            verify(deviationRecorder, never()).recordDeviation(any(), any());
+            assertTrue(row.isProcessed());
+        }
+
+        @Test
+        void breach_absentRequiredBehaviour_isTreatedAsOptional() {
+            // "must" is the only thing that makes a step mandatory. An unstated requiredBehavior
+            // states no requirement, so such a step is not judged either — the same reading the
+            // matcher takes when it decides what to schedule and what to pre-create.
+            StepInstance step = step(StepStatus.NOT_STARTED, null, null, null);
+            StepSlaStateTransition row = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusMinutes(1));
+            fetch(row, step);
+
+            applier.fetchAndApply(new ArrayList<>());
+
+            assertNull(step.getSlaStatus());
             verify(deviationRecorder, never()).recordDeviation(any(), any());
             assertTrue(row.isProcessed());
         }
@@ -199,17 +213,18 @@ class SlaTransitionApplierTest {
         }
 
         @Test
-        void completedAfterItsDueDate_optional_stillTakesAnOverdueDeviation() {
-            // The exemption is MISSED-only: optional work can still be reported as running late.
+        void completedAfterItsDueDate_optional_recordsNothing() {
+            // An optional step is never late, because it was never required. Matcher writes no
+            // schedule for one, so this row can only predate that rule — it is consumed, not judged.
             StepInstance step = step(StepStatus.COMPLETED, null, "could", now.minusMinutes(5));
             StepSlaStateTransition row = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusHours(1));
             fetch(row, step);
-            freshDeviation();
 
             applier.fetchAndApply(new ArrayList<>());
 
-            assertEquals(SlaStatus.OVERDUE, step.getSlaStatus());
-            verify(deviationRecorder).recordDeviation(step, DeviationType.OVERDUE);
+            assertNull(step.getSlaStatus());
+            verify(deviationRecorder, never()).recordDeviation(any(), any());
+            assertTrue(row.isProcessed());
         }
 
         @Test
@@ -280,61 +295,84 @@ class SlaTransitionApplierTest {
         }
     }
 
+    // ── the work arrived early; its own row carries the verdict ──
+
     @Nested
-    class OnTimeSweep {
+    class MetCondition {
 
         @Test
-        void aStepThatBeatItsDueDateIsRecordedMet() {
-            // Driven off step_instance: no transition row is fetched, and none is needed.
+        void aStepRecordedBeforeItsDueDateIsSettledMet() {
+            // Matcher writes this row when the completing event lands, with process_by = completed_at,
+            // so the verdict is reached on the next cycle rather than at a due date weeks away.
             StepInstance step = step(StepStatus.COMPLETED, null, "must", now.minusHours(3));
-            step.setDueDate(now.minusHours(1));
-            when(onTimeStepRepository.fetchOnTimeSteps(any())).thenReturn(List.of(step));
+            step.setDueDate(now.plusDays(4));
+            StepSlaStateTransition row = row(step, SlaTransitionType.MET_CONDITION_REACHED, now.minusHours(3));
+            fetch(row, step);
 
-            int count = applier.fetchAndSettleOnTime(new ArrayList<>());
+            int count = applier.fetchAndApply(new ArrayList<>());
 
             assertEquals(1, count);
             assertEquals(SlaStatus.MET, step.getSlaStatus());
-            verify(transitionRepository, never()).fetchDueTransitions(any(), any());
+            // Nothing deviant about work done on time.
             verify(deviationRecorder, never()).recordDeviation(any(), any());
+            assertTrue(row.isProcessed());
         }
 
         @Test
-        void theTransitionIsRecordedInHistory() {
-            // Why this is a row-at-a-time sweep rather than one bulk UPDATE: step_instance_history has
-            // to carry every sla_status transition, and a set update would skip it.
+        void theMetTransitionIsRecordedInHistory() {
             StepInstance step = step(StepStatus.COMPLETED, null, "must", now.minusHours(3));
-            step.setDueDate(now.minusHours(1));
-            when(onTimeStepRepository.fetchOnTimeSteps(any())).thenReturn(List.of(step));
+            step.setDueDate(now.plusDays(4));
+            StepSlaStateTransition row = row(step, SlaTransitionType.MET_CONDITION_REACHED, now.minusHours(3));
+            fetch(row, step);
 
-            applier.fetchAndSettleOnTime(new ArrayList<>());
+            applier.fetchAndApply(new ArrayList<>());
 
             verify(stateTransitionHistoryWriter).recordStepInstanceTransition(eq(step), any());
         }
 
         @Test
-        void anAlreadySettledStepIsRefusedRatherThanRelabelled() {
-            // The query excludes these; this is the belt to that braces. Timeliness is settled once
-            // decided, and a late completion must not be turned into an on-time one.
+        void anAlreadyJudgedStepIsRefusedRatherThanRelabelled() {
+            // Timeliness is settled once decided: a step some deadline already judged must not be told
+            // retrospectively that it was on time.
             StepInstance step = step(StepStatus.COMPLETED, SlaStatus.OVERDUE, "must", now.minusHours(3));
-            step.setDueDate(now.minusHours(1));
-            when(onTimeStepRepository.fetchOnTimeSteps(any())).thenReturn(List.of(step));
+            step.setDueDate(now.plusDays(4));
+            StepSlaStateTransition row = row(step, SlaTransitionType.MET_CONDITION_REACHED, now.minusHours(3));
+            fetch(row, step);
 
-            applier.fetchAndSettleOnTime(new ArrayList<>());
+            applier.fetchAndApply(new ArrayList<>());
 
             assertEquals(SlaStatus.OVERDUE, step.getSlaStatus());
             verify(stateTransitionHistoryWriter, never()).recordStepInstanceTransition(any(), any());
+            assertTrue(row.isProcessed());
         }
 
         @Test
-        void theFetchedIdsAreReportedToTheCaller() {
-            StepInstance step = step(StepStatus.COMPLETED, null, "must", now.minusHours(3));
-            step.setDueDate(now.minusHours(1));
-            when(onTimeStepRepository.fetchOnTimeSteps(any())).thenReturn(List.of(step));
-            List<UUID> fetched = new ArrayList<>();
+        void aStepThatNoLongerReadsAsOnTimeRecordsNothing() {
+            // The row schedules the question; the answer is still read off the step here. A row whose
+            // step does not beat its due date settles nothing, whatever the row says.
+            StepInstance step = step(StepStatus.COMPLETED, null, "must", now.minusHours(1));
+            step.setDueDate(now.minusHours(3));
+            StepSlaStateTransition row = row(step, SlaTransitionType.MET_CONDITION_REACHED, now.minusHours(1));
+            fetch(row, step);
 
-            applier.fetchAndSettleOnTime(fetched);
+            applier.fetchAndApply(new ArrayList<>());
 
-            assertEquals(List.of(step.getId()), fetched);
+            assertNull(step.getSlaStatus());
+            verify(deviationRecorder, never()).recordDeviation(any(), any());
+            assertTrue(row.isProcessed());
+        }
+
+        @Test
+        void aMetRowForAStepStillAwaitingItsEventRecordsNothing() {
+            StepInstance step = step(StepStatus.NOT_STARTED, null, "must", null);
+            step.setDueDate(now.plusDays(4));
+            StepSlaStateTransition row = row(step, SlaTransitionType.MET_CONDITION_REACHED, now.minusHours(1));
+            fetch(row, step);
+
+            applier.fetchAndApply(new ArrayList<>());
+
+            assertNull(step.getSlaStatus());
+            assertTrue(row.isProcessed());
         }
     }
 
@@ -345,17 +383,17 @@ class SlaTransitionApplierTest {
         void theOnlyFetchAsksForTheConfiguredBatchSize() {
             // One query, so the whole batch is its to fill — there is no room left over for a second.
             SlaTransitionApplier smallBatch = applierWithBatchSize(3);
-            when(transitionRepository.fetchDueTransitions(any(), any())).thenReturn(List.of());
+            when(transitionRepository.fetchTransitions(any(), any())).thenReturn(List.of());
 
             smallBatch.fetchAndApply(new ArrayList<>());
 
             ArgumentCaptor<Limit> limit = ArgumentCaptor.forClass(Limit.class);
-            verify(transitionRepository).fetchDueTransitions(any(), limit.capture());
+            verify(transitionRepository).fetchTransitions(any(), limit.capture());
             assertEquals(3, limit.getValue().max());
         }
 
         private SlaTransitionApplier applierWithBatchSize(int batchSize) {
-            return new SlaTransitionApplier(transitionRepository, onTimeStepRepository, stepInstanceRepository,
+            return new SlaTransitionApplier(transitionRepository, stepInstanceRepository,
                     deviationRecorder, stateTransitionHistoryWriter,
                     "test-instance", batchSize, 3600, new SimpleMeterRegistry());
         }
@@ -458,7 +496,7 @@ class SlaTransitionApplierTest {
         void missingStep_consumesTheRowRatherThanRetryingForever() {
             StepInstance step = step(StepStatus.NOT_STARTED, null, "must", null);
             StepSlaStateTransition row = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusMinutes(1));
-            when(transitionRepository.fetchDueTransitions(any(), any())).thenReturn(List.of(row));
+            when(transitionRepository.fetchTransitions(any(), any())).thenReturn(List.of(row));
             when(stepInstanceRepository.findAllById(List.of(step.getId()))).thenReturn(List.of());
 
             applier.fetchAndApply(new ArrayList<>());
@@ -475,7 +513,7 @@ class SlaTransitionApplierTest {
             StepInstance step = step(StepStatus.NOT_STARTED, null, "must", null);
             StepSlaStateTransition dueRow = row(step, SlaTransitionType.DUE_DATE_REACHED, now.minusHours(2));
             StepSlaStateTransition missedRow = row(step, SlaTransitionType.MISSED_DATE_REACHED, now.minusMinutes(1));
-            when(transitionRepository.fetchDueTransitions(any(), any())).thenReturn(List.of(dueRow, missedRow));
+            when(transitionRepository.fetchTransitions(any(), any())).thenReturn(List.of(dueRow, missedRow));
             when(stepInstanceRepository.findAllById(List.of(step.getId()))).thenReturn(List.of(step));
             freshDeviation();
 
@@ -520,7 +558,7 @@ class SlaTransitionApplierTest {
     }
 
     private void fetch(StepSlaStateTransition row, StepInstance step) {
-        when(transitionRepository.fetchDueTransitions(any(), any())).thenReturn(List.of(row));
+        when(transitionRepository.fetchTransitions(any(), any())).thenReturn(List.of(row));
         when(stepInstanceRepository.findAllById(List.of(step.getId()))).thenReturn(List.of(step));
     }
 

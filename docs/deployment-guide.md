@@ -4,6 +4,19 @@ Deploy **last**. This service creates no tables and validates its JPA mapping at
 fail fast against a `ccedb` the other two services have not yet migrated. Ordering rationale:
 [Architecture Overview §6](../../cce-common-util/docs/architecture-overview.md#6-deployment-order).
 
+> **Upgrading to the `MET_CONDITION_REACHED` release: this service goes up before the new Matcher.**
+> The Matcher's `V3` migration admits a third `transition_type` and the Matcher then starts writing it.
+> A Step SLA Service from before this release cannot map that value — its fetch throws on the unknown
+> enum constant, the whole batch rolls back, and every batch holding such a row backs off. So:
+>
+> 1. Roll this service to the new version first. It stops sweeping `step_instance` for `MET`, so
+>    on-time completions sit at a null `sla_status` for the length of the gap — nothing is lost.
+> 2. Roll the Matcher. `V3` runs at its startup and seeds a `MET_CONDITION_REACHED` row for every step
+>    the sweep had not settled, so the gap drains on the next few cycles.
+>
+> Reverse the order and the old service jams on rows it cannot read. There is no version in which both
+> write `MET`, so there is no double-write to worry about either way.
+
 ## Requirements
 
 | Component | Requirement |
@@ -190,26 +203,20 @@ replay this is the list to work from.
 | `/actuator/health/liveness` | Restart decisions |
 | `/actuator/prometheus` | Scrape target |
 
-Note what readiness does **not** cover: the scheduler. A pod can report ready while its SLA
-sweep is stalled. The metrics to alert on are `cce.sla.transitions.due` and
-`cce.sla.steps.on-time-unsettled` — see
-[Architecture §6](architecture-overview.md#6-observability) for how to read them alongside
+Note what readiness does **not** cover: the scheduler. A pod can report ready while its SLA sweep is
+stalled. The metric to alert on is `cce.sla.transitions.due` — see
+[Architecture §6](architecture-overview.md#6-observability) for how to read it alongside
 `evaluator.cycles` and `batches.failed`.
 
-**The two sweeps fail independently, and only one of them is counted.** `poll()` runs the breach sweep
-and the on-time sweep in separate `try`/`catch` blocks, deliberately, so a failure in one cannot stop
-the other. But `evaluator.cycles` and `evaluator.batches.failed` are incremented by the breach sweep
-alone. An on-time sweep that throws on every cycle therefore leaves `cycles` climbing normally,
-`batches.failed` flat and `transitions.due` at zero, while no completion is ever recorded `MET`.
-`cce.sla.steps.on-time-unsettled` rising is the only signal there is, which is why it belongs on the
-alert list and not just on a dashboard.
+One sweep now reaches every verdict, `MET` included, so there is a single failure mode to watch rather
+than two with different symptoms: a stalled service shows as `transitions.due` rising, whatever kind of
+row is piling up behind it.
 
 Suggested alerts:
 
 | Condition | Meaning |
 |---|---|
-| `cce.sla.transitions.due` rising for > 15 min | the breach sweep is not keeping up |
-| `cce.sla.steps.on-time-unsettled` rising for > 15 min | on-time completions are not being recorded `MET` — the second sweep is stalled |
+| `cce.sla.transitions.due` rising for > 15 min | the sweep is not keeping up — breaches, on-time completions or both |
 | `cce.sla.evaluator.batches.failed` increasing | rows are failing and backing off |
 | `cce.sla.evaluator.cycles` flat | the scheduler thread has stopped — liveness will not catch this |
 
@@ -223,11 +230,12 @@ and `deviation` are covered by the Matcher Service's backup.
 | Symptom | Likely cause |
 |---|---|
 | Startup fails: schema validation error | Deployed out of order — the Protocol and Matcher services must migrate `ccedb` first |
+| Every batch rolls back with `No enum constant … MET_CONDITION_REACHED` | An old build of this service against a post-`V3` database. Roll this service forward; see the upgrade note at the top |
 | `due` gauge rising, `cycles` incrementing | Sweep running but not keeping up — add replicas or raise `batch-size` |
 | `due` rising, `batches.failed` rising | Rows failing and backing off; check the logs for the rolled-back batch |
 | `cycles` not incrementing | Scheduler stopped; restart the pod. Liveness will not detect this |
 | A completed step is `OVERDUE` / `MISSED` although its `completed_at` beat the threshold | The row was judged before the Matcher Service had matched the completing event — the [Event Replay](#event-replay--sequencing-the-two-services) sequence was not held. Not self-correcting |
 | A step's `sla_status` looks wrong for a completed step | This service is its **only** writer — Matcher records `step_status` and `completed_at` and never judges timeliness. Compare `completed_at` against the row's `process_by` ([Architecture §4](architecture-overview.md#4-what-the-applier-does)) |
-| A completed step stays at a null `sla_status` | It has no `due_date`, so nothing judges it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |
+| A completed step stays at a null `sla_status` | It has no `due_date`, or it is optional, so nothing schedules a verdict for it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |
 | A settled step still has an unprocessed `MISSED_DATE_REACHED` row | Expected, not a stuck row. A row is taken when its own deadline arrives, so a step completed before its missed date keeps that row until the date passes — then it is consumed and records nothing |
-| `on-time-unsettled` rising while `due` sits at zero | The on-time sweep is failing; look for `On-time settlement cycle failed` in the logs. The breach sweep is unaffected, so `cycles` and `batches.failed` look healthy |
+| A step completed well before its due date is still null | Its `MET_CONDITION_REACHED` row has not been applied yet, or was never written — Matcher writes it at completion, and only for a mandatory step with a `due_date` |

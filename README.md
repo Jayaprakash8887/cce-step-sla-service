@@ -1,9 +1,9 @@
 # CCE Step SLA Service
 
-The time plane of the CCE system. Picks up the SLA transitions the Matcher Service scheduled as their
-deadlines pass and records the resulting `OVERDUE` / `MISSED` deviations; separately sweeps
-`step_instance` for completed steps that beat their `due_date` and records those as `MET`, needing no
-schedule to do it. It writes `step_instance.sla_status` — it is the column's only writer.
+The time plane of the CCE system. Picks up the SLA transitions the Matcher Service scheduled — as their
+deadlines pass, or as soon as work is recorded on time — and writes the resulting `OVERDUE`, `MISSED`
+or `MET` verdict with its deviation. It writes `step_instance.sla_status` — it is the column's only
+writer.
 
 It matches no events, enrols no patients and manages no definitions. It **owns no tables** and runs no
 migrations. It uses **no Kafka** — it neither consumes nor publishes.
@@ -57,35 +57,32 @@ Gradle composite build assumes.
 ```
 @Scheduled poll ──> SlaTransitionEvaluator      drives; holds no transaction
                           │
-        ┌─────────────────┴─────────────────┐
-        ▼                                   ▼
-  1. breach sweep                     2. on-time sweep
-  step_sla_state_transition           step_instance
-  is_processed = false,               COMPLETED, sla_status NULL,
-  next_attempt_at <= now              completed_at < due_date
-        │                                   │
-        ▼                                   ▼
-  SlaTransitionApplier                write MET
-  one transaction per batch           (+ history row)
-        │
-        ├───────────────┐
-        ▼               ▼
-  step_instance      deviation
-  .sla_status
+                          ▼
+                  step_sla_state_transition
+                  is_processed = false, next_attempt_at <= now
+                  (DUE_DATE_REACHED · MISSED_DATE_REACHED · MET_CONDITION_REACHED)
+                          │
+                          ▼
+                  SlaTransitionApplier          one transaction per batch
+                          │
+        ┌─────────────────┼─────────────────┐
+        ▼                 ▼                 ▼
+  step_instance      step_instance       deviation
+  .sla_status        _history            (breaches only)
 ```
 
-Both sweeps run every cycle. A breach needs a schedule to come round; whether work was recorded on
-time needs only the step's own `completed_at` and `due_date`, so it is settled without one — which is
-what stops an early completion reading as null until its due date, weeks away.
+One table, one loop, every verdict. A deadline row comes round when its threshold falls; the
+`MET_CONDITION_REACHED` row is written by Matcher at the completion itself, with `process_by` equal to
+that `completed_at`, so it is already due and the verdict lands on the next cycle instead of waiting
+for a due date that could be weeks away.
 
 The row lock **is** what reserves the row — no lease table, no heartbeat, no leader election. Every replica can
 poll the same table concurrently, and a replica that dies mid-batch releases its rows immediately.
 
-A row is fetched for one reason — its schedule came round — and what it decides is a breach:
-`completed_at` against its `process_by`, never the wall clock. `MET` is not a row's to decide — the
-on-time sweep settles that from the step's own `completed_at` and `due_date`, so an early completion is
-recorded without waiting for a deadline that would only confirm it. Details in
-[Architecture §3](docs/architecture-overview.md#3-the-fetch-and-apply-cycle).
+A row is fetched for one reason — its schedule came round — and what it decides is read from the step:
+`completed_at` against the row's `process_by` for a breach, against the step's `due_date` for `MET`.
+The wall clock never enters into it, so *when* a row is applied cannot change what it decides. Details
+in [Architecture §3](docs/architecture-overview.md#3-the-fetch-and-apply-cycle).
 
 ## API
 
@@ -96,7 +93,7 @@ by a request.
 ## Testing
 
 ```bash
-./gradlew test              # 46 tests (44 unit + 2 context-boot tests)
+./gradlew test              # 43 tests (41 unit + 2 context-boot tests)
 ./gradlew build             # tests + coverage gate (0.98 instruction coverage)
 ./gradlew jacocoTestReport  # build/reports/jacoco/test/html/index.html
 ```

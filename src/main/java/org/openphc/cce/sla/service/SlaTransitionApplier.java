@@ -4,14 +4,13 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.openphc.cce.common.entity.StepInstance;
 import org.openphc.cce.common.entity.StepSlaStateTransition;
-import org.openphc.cce.common.enums.DeviationType;
 import org.openphc.cce.common.enums.SlaStatus;
 import org.openphc.cce.common.enums.SlaTransitionType;
 import org.openphc.cce.common.enums.StepStatus;
 import org.openphc.cce.common.repository.StepInstanceRepository;
+import org.openphc.cce.common.support.RequiredBehavior;
 import org.openphc.cce.common.deviation.DeviationRecorder;
 import org.openphc.cce.common.history.StateTransitionHistoryWriter;
-import org.openphc.cce.sla.domain.repository.OnTimeStepFetchRepository;
 import org.openphc.cce.sla.domain.repository.SlaTransitionFetchRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,41 +55,53 @@ import java.util.stream.Collectors;
  * completing event — against the threshold the row stands for. The wall clock never enters into it:
  * what a deadline <em>means</em> depends only on whether the work had happened by then.
  *
- * <p>A breach is all a transition row decides. {@code OVERDUE} and {@code MISSED} are measured against
- * its {@code process_by}, which is what a schedule exists to detect and what the row carries.
+ * <p>Every verdict comes from a row, including {@code MET}. {@code OVERDUE} and {@code MISSED} are
+ * breaches of a deadline, measured against the {@code process_by} the row carries. {@code MET} is not a
+ * breach but a condition already satisfied: Matcher writes a {@code MET_CONDITION_REACHED} row the
+ * moment a completing event lands before the step's due date, with that {@code completed_at} as its
+ * {@code process_by}, so the row is due at once and this service records the verdict on its next cycle.
+ * One fetch, one loop, one table — there is no second sweep of {@code step_instance}.
  *
- * <p>{@code MET} is not decided here at all. Whether work was recorded <em>on time</em> is a question
- * about the step, answerable from {@code step_instance.completed_at} against
- * {@code step_instance.due_date} with no schedule to consult, so {@link #fetchAndSettleOnTime} sweeps
- * {@code step_instance} for it directly. A row whose threshold was kept therefore records nothing and is
- * simply consumed.
+ * <p>A row is fetched for exactly one reason: its schedule has come round, and the verdict it stands
+ * for must be reached ({@code fetchTransitions}). Nothing pulls a step's remaining rows forward because
+ * the step completed or was judged — a settled step keeps its unspent schedule until those dates
+ * arrive, and each row is consumed then, recording nothing.
  *
- * <p>A row is fetched for exactly one reason: its schedule has come round, and the work must be judged
- * against its threshold ({@code fetchDueTransitions}). Nothing pulls a step's remaining rows forward
- * because the step completed or was judged — a settled step keeps its unspent schedule until those
- * dates arrive, and each row is consumed then, recording nothing.
+ * <h2>Only mandatory steps are judged</h2>
+ * A deadline is the point at which work the protocol <em>required</em> has not been recorded, so only a
+ * mandatory step can breach one. Matcher schedules no row for an optional step, and a protocol that
+ * gives an optional action a {@code tolerance-days} is rejected at load. A row for an optional step can
+ * therefore only be one written before those rules — it is consumed, leaving no {@code sla_status} and
+ * no deviation, whichever threshold it stands for. The table below describes mandatory steps.
  *
  * <table border="1">
- *   <caption>Behaviour by threshold and step state</caption>
+ *   <caption>Behaviour by threshold and step state, for a mandatory step</caption>
  *   <tr><th>Row</th><th>Step state when applied</th><th>Action</th></tr>
  *   <tr><td>{@code DUE_DATE_REACHED}</td><td>not completed</td>
  *       <td>{@code OVERDUE} + {@code OVERDUE} deviation</td></tr>
  *   <tr><td>{@code DUE_DATE_REACHED}</td><td>{@code completed_at >= process_by}</td>
  *       <td>{@code OVERDUE} + {@code OVERDUE} deviation — recorded, but late</td></tr>
  *   <tr><td>{@code DUE_DATE_REACHED}</td><td>{@code completed_at < process_by}</td>
- *       <td>consume — no breach; {@code MET} is settled from the step, not from this row</td></tr>
+ *       <td>consume — no breach; the step's {@code MET_CONDITION_REACHED} row carries that verdict,
+ *       and reached it when the work landed</td></tr>
  *   <tr><td>{@code MISSED_DATE_REACHED}</td><td>not completed</td>
- *       <td>{@code MISSED} + {@code MISSED} deviation ({@code must} only)</td></tr>
+ *       <td>{@code MISSED} + {@code MISSED} deviation</td></tr>
  *   <tr><td>{@code MISSED_DATE_REACHED}</td><td>{@code completed_at >= process_by}</td>
- *       <td>{@code MISSED} + {@code MISSED} deviation ({@code must} only)</td></tr>
+ *       <td>{@code MISSED} + {@code MISSED} deviation</td></tr>
  *   <tr><td>{@code MISSED_DATE_REACHED}</td><td>{@code completed_at < process_by}</td>
  *       <td>consume — this threshold was not breached, and the due-date row already had its say</td></tr>
+ *   <tr><td>{@code MET_CONDITION_REACHED}</td><td>{@code completed_at < due_date}</td>
+ *       <td>{@code MET}, no deviation — there is nothing deviant about work done on time</td></tr>
+ *   <tr><td>{@code MET_CONDITION_REACHED}</td><td>anything else</td>
+ *       <td>consume — the step no longer reads as on time; the judgement is made here, from the step,
+ *       not taken on the row's word</td></tr>
  * </table>
  *
- * <p>The last row is the one worth being careful about: a step completed <em>between</em> its two
- * thresholds did not breach the missed date, but it is not {@code MET} either — it is the {@code OVERDUE}
- * the due-date row made it. "Did not breach this threshold" and "met its SLA" are only the same thing at
- * the due date, which is why {@code MET} is written on that row alone.
+ * <p>The missed-date row of a completed step is the one worth being careful about: a step completed
+ * <em>between</em> its two thresholds did not breach the missed date, but it is not {@code MET} either
+ * — it is the {@code OVERDUE} the due-date row made it, and it has no {@code MET_CONDITION_REACHED} row
+ * because it never beat its due date. "Did not breach this threshold" and "met its SLA" are only the
+ * same thing at the due date.
  *
  * <p>{@code step_status} is never written here. Crossing a deadline says nothing about whether the event
  * arrived.
@@ -109,7 +120,6 @@ public class SlaTransitionApplier {
     private static final int ATTEMPTS_BEFORE_ALERT = 5;
 
     private final SlaTransitionFetchRepository transitionRepository;
-    private final OnTimeStepFetchRepository onTimeStepRepository;
     private final StepInstanceRepository stepInstanceRepository;
     private final DeviationRecorder deviationRecorder;
     private final StateTransitionHistoryWriter stateTransitionHistoryWriter;
@@ -117,10 +127,9 @@ public class SlaTransitionApplier {
     private final int batchSize;
     private final Duration maxBackoff;
     private final Counter appliedCounter;
-    private final Counter consumedCounter;
+    private final Counter skippedCounter;
 
     public SlaTransitionApplier(SlaTransitionFetchRepository transitionRepository,
-                                OnTimeStepFetchRepository onTimeStepRepository,
                                 StepInstanceRepository stepInstanceRepository,
                                 DeviationRecorder deviationRecorder,
                                 StateTransitionHistoryWriter stateTransitionHistoryWriter,
@@ -129,7 +138,6 @@ public class SlaTransitionApplier {
                                 @Value("${cce.sla.max-backoff-seconds:3600}") long maxBackoffSeconds,
                                 MeterRegistry meterRegistry) {
         this.transitionRepository = transitionRepository;
-        this.onTimeStepRepository = onTimeStepRepository;
         this.stepInstanceRepository = stepInstanceRepository;
         this.deviationRecorder = deviationRecorder;
         this.stateTransitionHistoryWriter = stateTransitionHistoryWriter;
@@ -139,8 +147,8 @@ public class SlaTransitionApplier {
         this.appliedCounter = Counter.builder("cce.sla.transitions.applied")
                 .description("SLA transitions that wrote a step's sla_status")
                 .register(meterRegistry);
-        this.consumedCounter = Counter.builder("cce.sla.transitions.consumed")
-                .description("SLA transitions closed without writing a status or a deviation")
+        this.skippedCounter = Counter.builder("cce.sla.transitions.skipped")
+                .description("Breached SLA transitions that recorded neither a status nor a deviation")
                 .register(meterRegistry);
     }
 
@@ -160,7 +168,7 @@ public class SlaTransitionApplier {
     @Transactional
     public int fetchAndApply(List<UUID> fetched) {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-        List<StepSlaStateTransition> dueRows = transitionRepository.fetchDueTransitions(now, Limit.of(batchSize));
+        List<StepSlaStateTransition> dueRows = transitionRepository.fetchTransitions(now, Limit.of(batchSize));
         Map<UUID, StepInstance> stepsById = loadStepsFor(dueRows);
 
         for (StepSlaStateTransition row : dueRows) {
@@ -211,11 +219,14 @@ public class SlaTransitionApplier {
             return;
         }
 
-        if (breachedThreshold(row, step)) {
+        if (row.getTransitionType() == SlaTransitionType.MET_CONDITION_REACHED) {
+            applyOnTime(row, step);
+        } else if (breachedThreshold(row, step)) {
             applyBreach(row, step);
-        } else {
-            applyKeptDeadline(row, step);
         }
+        // A deadline that was kept records nothing: the step's own MET row carries that verdict, and
+        // beating the missed date says only that the step was not written off. Such a row falls
+        // straight through to being marked processed.
         markProcessed(row);
     }
 
@@ -235,78 +246,65 @@ public class SlaTransitionApplier {
         return completedAt == null || !completedAt.isBefore(row.getProcessBy());
     }
 
+    /**
+     * The work was recorded before the due date: settle the step as {@code MET}.
+     *
+     * <p>Matcher writes this row when the completing event lands, so it is due immediately and the
+     * verdict is reached within a cycle rather than at a due date that may be weeks away. The judgement
+     * is still made here, from the step's own columns — Matcher scheduled the question, it did not
+     * answer it.
+     *
+     * <p>No deviation: there is nothing deviant about work done on time.
+     */
+    private void applyOnTime(StepSlaStateTransition row, StepInstance step) {
+        if (!beatItsDueDate(step)) {
+            skippedCounter.increment();
+            log.warn("Step {} no longer reads as on time (stepStatus={}, completedAt={}, dueDate={}) — "
+                            + "transition {} records nothing",
+                    step.getId(), step.getStepStatus(), step.getCompletedAt(), step.getDueDate(),
+                    row.getId());
+            return;
+        }
+
+        if (!writeSlaStatus(step, SlaStatus.MET)) {
+            // Already judged: a re-fetched row, or a deadline that beat this row to the step.
+            skippedCounter.increment();
+            return;
+        }
+
+        log.debug("Step {} was recorded at {}, before its due date of {} — MET",
+                step.getId(), step.getCompletedAt(), step.getDueDate());
+    }
+
+    /** Whether the step's own columns still say the work beat its deadline. */
+    private boolean beatItsDueDate(StepInstance step) {
+        return step.getStepStatus() == StepStatus.COMPLETED
+                && step.getCompletedAt() != null
+                && step.getDueDate() != null
+                && step.getCompletedAt().isBefore(step.getDueDate());
+    }
+
     /** The deadline was not met: advance the SLA and record the deviation. */
     private void applyBreach(StepSlaStateTransition row, StepInstance step) {
-        if (isOptionalMiss(row, step)) {
-            // Nothing was required of an optional step, so nothing was breached by its not happening —
-            // and its sla_status stays whatever the due date made it.
-            consumedCounter.increment();
-            log.debug("Step {} is optional — transition {} records no MISSED status or deviation",
-                    step.getId(), row.getId());
+        if (!RequiredBehavior.isMandatory(step.getRequiredBehavior())) {
+            // Nothing was required of an optional step, so nothing was breached by its not happening.
+            // Matcher no longer schedules one at all, and a protocol that gives an optional action a
+            // deadline is now rejected at load — so this is a row written before those rules, kept
+            // judgeable only so it can be closed rather than retried. It leaves no verdict behind.
+            skippedCounter.increment();
+            log.warn("Step {} is optional (requiredBehavior={}) — transition {} is a stale schedule "
+                            + "and records no status or deviation",
+                    step.getId(), step.getRequiredBehavior(), row.getId());
             return;
         }
 
         if (!writeSlaStatus(step, row.getTransitionType().breachStatus())) {
             // Already at or past this outcome: a re-fetched row, or rows applied out of order.
-            consumedCounter.increment();
+            skippedCounter.increment();
             return;
         }
 
         raiseDeviationFor(row, step);
-    }
-
-    /**
-     * The threshold was kept, so this row has nothing to record. Keeping a threshold is not a verdict
-     * on timeliness: {@code MET} is a statement about the step, settled from {@code step_instance.due_date}
-     * by {@link #fetchAndSettleOnTime}, and beating the missed date says nothing more than that the step
-     * was not written off.
-     *
-     * <p>So the row is consumed either way. A step that was on time has been recorded as such already,
-     * or will be on the next sweep.
-     */
-    private void applyKeptDeadline(StepSlaStateTransition row, StepInstance step) {
-        consumedCounter.increment();
-        log.debug("Step {} kept its {} threshold of {} — transition consumed",
-                step.getId(), row.getTransitionType(), row.getProcessBy());
-    }
-
-    /**
-     * Settle a batch of steps that beat their due date as {@code MET}.
-     *
-     * <p>Reads {@code step_instance} rather than the schedule. Whether work was recorded on time is a
-     * question about the step, answerable from {@code completed_at} against {@code due_date}, so no
-     * transition row is fetched and none is needed: a {@code DUE_DATE_REACHED} row exists to detect a
-     * breach, and there is no breach here to detect.
-     *
-     * <p>The step's own {@code sla_status} is the idempotency record. A step is fetched only while that
-     * is null, and writing {@code MET} takes it out of the set for good — so there is nothing to mark
-     * processed and no attempt count to keep. A step already {@code OVERDUE} was never in the set, and
-     * {@link #writeSlaStatus} would refuse the write regardless: timeliness is settled once decided.
-     *
-     * <p>Per row rather than one bulk {@code UPDATE}, because {@link #writeSlaStatus} also appends to
-     * {@code step_instance_history}, which has to hold every {@code sla_status} transition. A set update
-     * would leave a gap in the history exactly where a step went on time.
-     *
-     * <p>The step's pending {@code DUE_DATE_REACHED} row is left alone: it is fetched when its schedule
-     * comes round and consumed then, finding the step already settled. That is also what keeps it out of
-     * the backlog gauge.
-     *
-     * @param fetched receives the ids fetched, so a caller can report them after a rollback
-     * @return how many steps were fetched
-     */
-    @Transactional
-    public int fetchAndSettleOnTime(List<UUID> fetched) {
-        List<StepInstance> onTimeSteps = onTimeStepRepository.fetchOnTimeSteps(Limit.of(batchSize));
-        for (StepInstance step : onTimeSteps) {
-            fetched.add(step.getId());
-            if (writeSlaStatus(step, SlaStatus.MET)) {
-                log.debug("Step {} beat its due date of {} — recorded MET",
-                        step.getId(), step.getDueDate());
-            } else {
-                consumedCounter.increment();
-            }
-        }
-        return onTimeSteps.size();
     }
 
     /**
@@ -366,28 +364,13 @@ public class SlaTransitionApplier {
     }
 
     /**
-     * Whether this row is an optional step's missed threshold.
-     *
-     * <p>A {@code MISSED} deviation is {@code must}-only, so an optional step neither takes the status
-     * nor the deviation. An {@code OVERDUE} carries no such exemption: optional work can still be
-     * reported as running late.
-     */
-    private boolean isOptionalMiss(StepSlaStateTransition row, StepInstance step) {
-        return row.getTransitionType() == SlaTransitionType.MISSED_DATE_REACHED
-                && "could".equals(step.getRequiredBehavior());
-    }
-
-    /**
-     * The deviation a breach produces: the due date an {@code OVERDUE}, the missed date a
-     * {@code MISSED}. {@link DeviationRecorder} de-duplicates on the step and type, so a re-fetched row
-     * cannot record the same deviation twice.
+     * The deviation a breach produces — the due date an {@code OVERDUE}, the missed date a
+     * {@code MISSED} — read off the row's own type, which is where that mapping is declared.
+     * {@link DeviationRecorder} de-duplicates on the step and type, so a re-fetched row cannot record
+     * the same deviation twice.
      */
     private void raiseDeviationFor(StepSlaStateTransition row, StepInstance step) {
-        DeviationType type = row.getTransitionType() == SlaTransitionType.DUE_DATE_REACHED
-                ? DeviationType.OVERDUE
-                : DeviationType.MISSED;
-
-        deviationRecorder.recordDeviation(step, type);
+        deviationRecorder.recordDeviation(step, row.getTransitionType().breachDeviation());
     }
 
     private void markProcessed(StepSlaStateTransition row) {

@@ -29,7 +29,8 @@ import java.util.UUID;
 public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaStateTransition, UUID> {
 
     /**
-     * Fetch a batch of transitions whose deadline has passed.
+     * Fetch a batch of transitions that have come round: a deadline that has passed, or a step recorded
+     * on time whose {@code MET} is waiting to be written.
      *
      * <p>{@code FOR UPDATE SKIP LOCKED} — expressed by the {@code -2} lock timeout — is what makes this
      * safe to run on every instance at once: each caller takes rows no one else holds and steps over the
@@ -41,6 +42,11 @@ public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaState
      * record of when the deadline fell. Matches the partial index {@code idx_sslt_due}, so the scan
      * covers only the unprocessed backlog. Ordered by {@code process_by} so the oldest deadline is
      * always applied first, however often a row has been deferred.
+     *
+     * <p>One query for all three transition types. {@code MET_CONDITION_REACHED} needs no predicate of
+     * its own: Matcher writes it with a {@code process_by} of the {@code completed_at} that satisfied it,
+     * so it is already past and this fetch takes it on the next cycle — which is what retired the
+     * separate sweep of {@code step_instance} that used to settle {@code MET}.
      *
      * <p>The only way a transition row is fetched. There is deliberately no second path reaching rows by
      * their step's state — taking a settled step's remaining row ahead of its deadline would buy nothing
@@ -59,12 +65,12 @@ public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaState
               AND t.nextAttemptAt <= :now
             ORDER BY t.processBy ASC
             """)
-    List<StepSlaStateTransition> fetchDueTransitions(@Param("now") OffsetDateTime now, Limit limit);
+    List<StepSlaStateTransition> fetchTransitions(@Param("now") OffsetDateTime now, Limit limit);
 
     /**
      * The {@code cce.sla.transitions.due} gauge: rows the next cycle will fetch.
      *
-     * <p>Carries {@link #fetchDueTransitions}'s predicate exactly, deliberately — the gauge has to count
+     * <p>Carries {@link #fetchTransitions}'s predicate exactly, deliberately — the gauge has to count
      * what the next cycle will fetch, or it stops being a backlog. Counting every unprocessed row would
      * instead fold in the whole future schedule, so it would track enrolment volume rather than lateness
      * and could never sit near zero.
