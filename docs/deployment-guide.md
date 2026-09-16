@@ -12,7 +12,9 @@ fail fast against a `ccedb` the other two services have not yet migrated. Orderi
 > 1. Roll this service to the new version first. It stops sweeping `step_instance` for `MET`, so
 >    on-time completions sit at a null `sla_status` for the length of the gap — nothing is lost.
 > 2. Roll the Matcher. `V3` runs at its startup and seeds a `MET_CONDITION_REACHED` row for every step
->    the sweep had not settled, so the gap drains on the next few cycles.
+>    the sweep had not settled, so the gap drains on the next few cycles. `V4` follows it and deletes
+>    every row belonging to an optional step — expect `cce.sla.transitions.due` to drop, and expect the
+>    drop to be large on a database carrying protocols that gave optional actions a `tolerance-days`.
 >
 > Reverse the order and the old service jams on rows it cannot read. There is no version in which both
 > write `MET`, so there is no double-write to worry about either way.
@@ -241,6 +243,6 @@ and `deviation` are covered by the Matcher Service's backup.
 | `cycles` not incrementing | Scheduler stopped; restart the pod. Liveness will not detect this |
 | A completed step is `OVERDUE` / `MISSED` although its `completed_at` beat the threshold | The row was judged before the Matcher Service had matched the completing event — the [Event Replay](#event-replay--sequencing-the-two-services) sequence was not held. Not self-correcting |
 | A step's `sla_status` looks wrong for a completed step | This service is its **only** writer — Matcher records `step_status` and `completed_at` and never judges timeliness. Compare `completed_at` against the row's `process_by` ([Architecture §4](architecture-overview.md#4-what-the-applier-does)) |
-| A completed step stays at a null `sla_status` | It has no `due_date`, or it is optional, so nothing schedules a verdict for it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |
+| A completed step stays at a null `sla_status` | It is optional, or it is a 1.x row with no `due_date`, so nothing schedules a verdict for it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |
 | A settled step still has an unprocessed `MISSED_DATE_REACHED` row | Expected, not a stuck row. A row is taken when its own deadline arrives, so a step completed before its missed date keeps that row until the date passes — then it is consumed and records nothing |
 | A step completed well before its due date is still null | Its `MET_CONDITION_REACHED` row has not been applied yet, or was never written — Matcher writes it at completion, and only for a mandatory step with a `due_date` |

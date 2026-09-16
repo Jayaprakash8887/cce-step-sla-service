@@ -307,9 +307,10 @@ time. Timeliness is asked once, on its own row, against the step's `due_date` �
 between its thresholds never gets such a row, because Matcher only writes one for work that landed
 before the due date.
 
-A step with no `due_date` is therefore never recorded `MET`. It has no deadline to have beaten — a step
-created from its own trigger is the usual case — so no `MET_CONDITION_REACHED` row is written for it
-and its `sla_status` stays null, which is what null means.
+A step with no `due_date` is therefore never recorded `MET`. It has no deadline to have beaten, so no
+`MET_CONDITION_REACHED` row is written for it and its `sla_status` stays null, which is what null means.
+In practice that is a row carried over from 1.x: every step the current Matcher creates is given a due
+date, a step created from its own trigger being stamped with the moment it was created.
 
 Writes are **forward-only** for the same reason. `MET` and `MISSED` are settled outcomes, and `OVERDUE`
 must never replace `MISSED` — which is exactly what a retry applying a step's two rows out of order
@@ -333,9 +334,10 @@ it is optional exactly as `could` is. `RequiredBehavior.isMandatory` is the sing
 progressive instantiation, SLA scheduling and the judgement here, so a step cannot be required by one
 rule and optional by the next.
 
-A row for an optional step can therefore only be one written before those rules. The applier **consumes
-it**, recording no `sla_status` and no deviation, whatever the row stands for, and logs it as a stale
-schedule. That check sits ahead of the type dispatch, so it covers `MET_CONDITION_REACHED` as well as
+A row for an optional step can therefore only be one written before those rules — and the Matcher's `V4`
+migration deleted those, including the ones `V2`'s upgrade backfill seeds, so the table holds mandatory
+rows only. The applier still **consumes** any it meets, recording no `sla_status` and no deviation
+whatever the row stands for, and logs it as a stale schedule. That check sits ahead of the type dispatch, so it covers `MET_CONDITION_REACHED` as well as
 the two deadlines: the rule is enforced where rows are written *and* where they are judged, so neither
 side alone has to be trusted.
 

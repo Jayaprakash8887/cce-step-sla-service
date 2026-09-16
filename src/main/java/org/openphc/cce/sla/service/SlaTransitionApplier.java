@@ -71,9 +71,11 @@ import java.util.stream.Collectors;
  * A deadline is the point at which work the protocol <em>required</em> has not been recorded, so only a
  * mandatory step can breach one. Matcher schedules no row for an optional step, and a protocol that
  * gives an optional action a {@code tolerance-days} is rejected at load. A row for an optional step can
- * therefore only be one written before those rules — it is consumed, leaving no {@code sla_status} and
- * no deviation, whatever it stands for, {@code MET} included. Scheduling and judging enforce that
- * separately, so neither alone has to be trusted. The table below describes mandatory steps.
+ * therefore only be one written before those rules, and the {@code V4} migration deleted those — so
+ * this is a guard against a row that should not exist at all. It is consumed, leaving no
+ * {@code sla_status} and no deviation, whatever it stands for, {@code MET} included. Scheduling and
+ * judging enforce the rule separately, so neither alone has to be trusted. The table below describes
+ * mandatory steps.
  *
  * <table border="1">
  *   <caption>Behaviour by threshold and step state, for a mandatory step</caption>
