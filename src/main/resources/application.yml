@@ -48,6 +48,11 @@ cce:
     # can poll concurrently. This interval is the steady-state cost — one empty fetch query per tick; a
     # backlog is drained within a single cycle rather than one batch per tick.
     poll-interval-ms: ${CCE_SLA_POLL_INTERVAL_MS:5000}
+    # The fetch locks every step tied to a row in the batch for the whole transaction (see
+    # SlaTransitionFetchRepository), so a larger batch holds step_instance locks longer and blocks
+    # Matcher's writes to those steps for longer. SlaTransitionApplier.MAX_BATCH_SIZE (100) refuses to
+    # start above that — see its Javadoc for the measurements. Do not raise this past 100 without
+    # re-measuring on production-scale hardware.
     batch-size: ${CCE_SLA_BATCH_SIZE:100}
     # Recorded in processed_by, so each row says which replica applied it.
     instance-id: ${CCE_SLA_INSTANCE_ID:${HOSTNAME:local}}

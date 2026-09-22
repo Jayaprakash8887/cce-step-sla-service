@@ -408,6 +408,23 @@ class SlaTransitionApplierTest {
             assertEquals(3, limit.getValue().max());
         }
 
+        @Test
+        void theConfiguredMaximumIsAccepted() {
+            // The fetch locks every step in the batch for the whole transaction, so 100 is not an
+            // arbitrary default — it is measured (see MAX_BATCH_SIZE's Javadoc). The boundary itself
+            // must still start up cleanly.
+            assertDoesNotThrow(() -> applierWithBatchSize(100));
+        }
+
+        @Test
+        void aBatchSizePastTheMeasuredCeilingFailsAtStartup() {
+            // Fail when the bean is constructed, not on the first oversized batch in production.
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                    () -> applierWithBatchSize(101));
+            assertTrue(ex.getMessage().contains("101"));
+            assertTrue(ex.getMessage().contains("100"));
+        }
+
         private SlaTransitionApplier applierWithBatchSize(int batchSize) {
             return new SlaTransitionApplier(transitionRepository, stepInstanceRepository,
                     deviationRecorder, stateTransitionHistoryWriter,

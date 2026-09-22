@@ -2,6 +2,7 @@ package org.openphc.cce.sla.domain.repository;
 
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
+import org.openphc.cce.common.entity.StepInstance;
 import org.openphc.cce.common.entity.StepSlaStateTransition;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -23,7 +24,9 @@ import java.util.UUID;
  * service's alone, so the query that does it — and the pessimistic lock it takes — lives here rather than
  * somewhere the Matcher Service could reach for it.
  *
- * <p>One fetch, one gate: {@code next_attempt_at} passing is the only thing that makes a row eligible.
+ * <p>{@code next_attempt_at} passing is what makes a row eligible; {@code process_by} is joined in as a
+ * redundant, index-friendly bound (see {@link #fetchTransitions}) and to bring {@code step_instance}
+ * into the same lock.
  */
 @Repository
 public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaStateTransition, UUID> {
@@ -34,14 +37,29 @@ public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaState
      *
      * <p>{@code FOR UPDATE SKIP LOCKED} — expressed by the {@code -2} lock timeout — is what makes this
      * safe to run on every instance at once: each caller takes rows no one else holds and steps over the
-     * rest instead of blocking. The row lock <em>is</em> what reserves the row, so no lease table and no leader
-     * election are needed.
+     * rest instead of blocking. The row lock <em>is</em> what reserves the row, so no lease table and no
+     * leader election are needed.
+     *
+     * <h2>Why the join to {@code step_instance}</h2>
+     * A step has up to three transition rows (its two thresholds and its {@code MET_CONDITION_REACHED}),
+     * and {@code FOR UPDATE SKIP LOCKED} on {@code t} alone only protects a single row at a time — two
+     * replicas can each claim a different row of the <em>same</em> step and both judge it concurrently,
+     * racing on {@code step_instance.sla_status}. Joining {@code StepInstance} into this query, with no
+     * {@code JOIN FETCH} and no columns of {@code s} selected, brings it under the same
+     * {@code PESSIMISTIC_WRITE} lock: Hibernate emits {@code ... join step_instance ... for no key update
+     * skip locked}, so a row is skipped if either its own row or its step is already held. A step can
+     * therefore only ever be claimed by one replica at a time, for as long as that replica's transaction
+     * runs — see {@link org.openphc.cce.sla.service.SlaTransitionApplier}'s {@code MAX_BATCH_SIZE} for
+     * why {@code cce.sla.batch-size} is capped, which bounds how long that hold can last.
      *
      * <p>Selects on {@code next_attempt_at}, equal to {@code process_by} initially and pushed out by a
      * failure so a retry is deferred without rewriting {@code process_by} — which stays the immutable
-     * record of when the deadline fell. Matches the partial index {@code idx_sslt_due}, so the scan
-     * covers only the unprocessed backlog. Ordered by {@code process_by} so the oldest deadline is
-     * always applied first, however often a row has been deferred.
+     * record of when the deadline fell. The {@code process_by <= :now} bound is redundant with
+     * {@code next_attempt_at <= :now} ({@code next_attempt_at} is never earlier than {@code process_by}),
+     * but paired with the partial index {@code idx_sslt_due_order} (on {@code process_by}, Matcher's
+     * migration) it lets Postgres walk that index in {@code ORDER BY} order and stop after one batch,
+     * instead of reading and sorting the whole due backlog — the join makes that sort more expensive, not
+     * less, so the two changes ship together.
      *
      * <p>One query for all three transition types. {@code MET_CONDITION_REACHED} needs no predicate of
      * its own: Matcher writes it with a {@code process_by} of the {@code completed_at} that satisfied it,
@@ -61,8 +79,10 @@ public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaState
     @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
     @Query("""
             SELECT t FROM StepSlaStateTransition t
+            JOIN StepInstance s ON s.id = t.stepInstanceId
             WHERE t.processed = false
               AND t.nextAttemptAt <= :now
+              AND t.processBy <= :now
             ORDER BY t.processBy ASC
             """)
     List<StepSlaStateTransition> fetchTransitions(@Param("now") OffsetDateTime now, Limit limit);
@@ -70,10 +90,11 @@ public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaState
     /**
      * The {@code cce.sla.transitions.due} gauge: rows the next cycle will fetch.
      *
-     * <p>Carries {@link #fetchTransitions}'s predicate exactly, deliberately — the gauge has to count
-     * what the next cycle will fetch, or it stops being a backlog. Counting every unprocessed row would
-     * instead fold in the whole future schedule, so it would track enrolment volume rather than lateness
-     * and could never sit near zero.
+     * <p>Carries {@link #fetchTransitions}'s row-eligibility predicate — the gauge has to count what the
+     * next cycle will fetch, or it stops being a backlog. Counting every unprocessed row would instead
+     * fold in the whole future schedule, so it would track enrolment volume rather than lateness and
+     * could never sit near zero. Deliberately no join to {@code StepInstance} and no lock here: this is a
+     * plain count, not a claim, so it never contends with a replica mid-batch.
      */
     @Query("""
             SELECT COUNT(t) FROM StepSlaStateTransition t

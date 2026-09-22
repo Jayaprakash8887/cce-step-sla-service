@@ -148,17 +148,23 @@ service. `poll()` catches everything `evaluateDue()` throws, because an exceptio
 `@Scheduled` method stops the schedule. Every replica runs its own timer.
 
 **`fetchTransitions(now, batchSize)`** — the only query that brings a transition row in. Fetches rows
-where `is_processed = false AND next_attempt_at <= now`, ordered by `process_by`, under
-`FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2` timeout hint Hibernate translates to
-`SKIP LOCKED`). The predicate selects on `next_attempt_at` rather than `process_by`: the two are equal
-when the Matcher Service writes the row, and a failure pushes `next_attempt_at` out so a retry is
-deferred without rewriting `process_by`, which stays the immutable record of when the deadline fell. The
-partial index `idx_sslt_due` covers exactly this predicate, so the scan touches only the unprocessed
-backlog.
+where `is_processed = false AND next_attempt_at <= now AND process_by <= now`, ordered by `process_by`,
+under `FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2` timeout hint Hibernate translates
+to `SKIP LOCKED`). The `next_attempt_at` predicate is the real gate: it equals `process_by` when Matcher
+writes the row, and a failure pushes it out so a retry is deferred without rewriting `process_by`, which
+stays the immutable record of when the deadline fell. The `process_by <= now` bound is redundant with it
+(`next_attempt_at` is never earlier), but paired with the partial index `idx_sslt_due_order` (on
+`process_by`, a Matcher migration) it lets Postgres walk that index in `ORDER BY` order and stop after
+one batch, instead of reading and sorting the whole due backlog to return the top `batchSize`.
 
-Note what it does *not* read: this is a single-table query with no join to `step_instance`, so it knows
-nothing about whether the step completed. Eligibility here is purely "this row's gate has passed"; what
-the row *means* is decided later, in the apply.
+**The fetch also joins `step_instance`, under the same lock.** A step has up to three transition rows
+(its two thresholds and its `MET_CONDITION_REACHED`), and locking `step_sla_state_transition` rows alone
+only protects one row at a time — two replicas could each claim a different row of the *same* step and
+judge it concurrently, racing on `step_instance.sla_status`. The join brings `step_instance` under the
+same `FOR UPDATE`/`SKIP LOCKED` semantics (Hibernate emits `... join step_instance ... for no key update
+skip locked`), with no columns of it selected and no change to what the row's eligibility means: a step
+is now held by exactly one replica for as long as that replica's batch transaction runs. `MAX_BATCH_SIZE`
+(§7) bounds how long that hold can last.
 
 **any rows fetched?** — zero is the steady state: one empty indexed query per interval, and the cycle
 ends.
@@ -186,11 +192,13 @@ likely to break the next one too. See [Retry](#retry) for the backoff itself.
 
 Three properties make this safe without any coordination machinery:
 
-**The row lock is what reserves the row.** `FOR UPDATE SKIP LOCKED` means a row locked by one replica is
-*invisible* to the others rather than contended, so every replica can poll the same table concurrently.
-There is no lease table, no heartbeat, and no leader election. A replica that dies mid-batch drops its
-connection, its locks release, and the work is immediately available again — no lease expiry to wait
-out.
+**The row lock is what reserves the row — and, since the fetch joins it, the step too.**
+`FOR UPDATE SKIP LOCKED` means a row (or a step) locked by one replica is *invisible* to the others
+rather than contended, so every replica can poll the same table concurrently. There is no lease table, no
+heartbeat, and no leader election. A replica that dies mid-batch drops its connection, its locks release,
+and the work is immediately available again — no lease expiry to wait out. The trade-off is that a step
+tied to a row in the batch is held for the whole of that transaction, whether or not the row ends up
+writing anything, which is why `cce.sla.batch-size` is capped (§7) rather than left unbounded.
 
 **Fetch and apply share one transaction.** Fetching in one transaction and applying in another would
 leave a window where a row is marked taken but not yet acted on, and a crash inside that window makes
@@ -413,12 +421,24 @@ A burst of clinical events cannot delay the SLA sweep, and a large SLA backlog c
 processing.
 
 Replicas are safe to add freely: the fetch-and-apply cycle needs no coordination, and adding an instance
-adds throughput directly. The limiting factor is database contention on
-`step_sla_state_transition`, not anything in the application.
+adds throughput directly. The limiting factor is database contention on `step_sla_state_transition` and,
+since the fetch now joins it, `step_instance` — not anything in the application.
 
-`cce.sla.batch-size` trades transaction length against round trips. A larger batch holds row locks
-longer, which matters only if the Matcher Service is inserting into the same table heavily at the same
-time.
+`cce.sla.batch-size` trades transaction length against round trips, and now also against how long a
+batch's steps are held from Matcher: the fetch locks every step tied to a row in the batch for the whole
+transaction, not just the instant `sla_status` is written, so a larger batch means both a longer hold and
+more steps held.
+
+`SlaTransitionApplier.MAX_BATCH_SIZE` caps this at 100, enforced by refusing to start above it. Measured
+end to end on a 20-million-row `step_instance` table, batches of 250–350 rows reliably finished under the
+5-second poll interval; 450–550 straddled it with real run-to-run variance (450 rows ranged 4.5–9.7
+seconds across repeated runs, depending on whether that run's steps happened to be cache-resident); 550
+and above was over 5 seconds more often than not. The fetch itself stays in single-digit milliseconds
+regardless of table size — the cost is the apply loop, a single Hibernate session accumulating dirty
+state across the whole batch, which is why it does not scale smoothly with batch size. 100 sits well
+below where this starts, with margin for the variance observed. Raising it without re-measuring on
+production-scale hardware risks holding `step_instance` locks, and blocking Matcher's writes to those
+steps, for several seconds per batch.
 
 ## 8. Security
 

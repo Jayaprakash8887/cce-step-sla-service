@@ -42,6 +42,15 @@ import java.util.stream.Collectors;
  * reserves the row, so concurrent instances drain disjoint sets with no lease table and no leader election, and a
  * deviation can never be recorded without the row being marked processed in the same commit.
  *
+ * <h2>The fetch also locks the step</h2>
+ * {@link SlaTransitionFetchRepository#fetchTransitions} joins {@code StepInstance} under the same lock,
+ * so a step is held by exactly one replica for the whole of {@link #fetchAndApply} — not just for the
+ * instant {@link #writeSlaStatus} runs its {@code UPDATE}. That is what makes the forward-only check in
+ * {@link #writeSlaStatus} reliable: by the time it reads {@code sla_status}, no other replica can be
+ * concurrently judging the same step's other rows, and Matcher cannot be mid-completion on it either.
+ * {@link #MAX_BATCH_SIZE} bounds how long that hold can last, since every step tied to a row in the batch
+ * is locked from the fetch, whether or not that row turns out to need a write at all.
+ *
  * <p>Separate bean from {@link SlaTransitionEvaluator}, which drives the polling loop. Not cosmetic:
  * Spring's transaction proxy is bypassed by self-invocation, so a driver calling its own
  * {@code @Transactional} method would silently run it without a transaction.
@@ -60,7 +69,8 @@ import java.util.stream.Collectors;
  * breach but a condition already satisfied: Matcher writes a {@code MET_CONDITION_REACHED} row the
  * moment a completing event lands before the step's due date, with that {@code completed_at} as its
  * {@code process_by}, so the row is due at once and this service records the verdict on its next cycle.
- * One fetch, one loop, one table — there is no second sweep of {@code step_instance}.
+ * One fetch, one loop — there is no second sweep of {@code step_instance}, even though the fetch now
+ * joins it to take the step-level lock described above.
  *
  * <p>A row is fetched for exactly one reason: its schedule has come round, and the verdict it stands
  * for must be reached ({@code fetchTransitions}). Nothing pulls a step's remaining rows forward because
@@ -122,6 +132,26 @@ public class SlaTransitionApplier {
     /** Past this many attempts a row is logged as an error every cycle rather than failing quietly. */
     private static final int ATTEMPTS_BEFORE_ALERT = 5;
 
+    /**
+     * Hard ceiling on {@code cce.sla.batch-size}, enforced at startup.
+     *
+     * <p>The fetch locks every step tied to a row in the batch for the whole of {@link #fetchAndApply},
+     * not just the moment a write happens — see {@link SlaTransitionFetchRepository#fetchTransitions}.
+     * Measured end to end against this exact fetch-and-apply path (not a prototype) on a 20-million-row
+     * {@code step_instance} table: 250–350 rows reliably finished under the 5-second poll interval;
+     * 450–550 rows straddled it, with real run-to-run variance (450 rows ranged 4.5–9.7 seconds across
+     * repeated runs, driven by whether that run's randomly-selected steps happened to be cache-resident);
+     * 550 and above was over 5 seconds more often than not. The cost is dominated by the apply loop, not
+     * the fetch — a single Hibernate session accumulating dirty state across the whole batch — which is
+     * why it does not scale smoothly with batch size the way the fetch query's own cost does.
+     *
+     * <p>100 — the existing default — sits comfortably below where this starts, with margin for the
+     * variance observed. Raising this value without re-measuring on production-scale hardware risks
+     * holding {@code step_instance} locks, and therefore blocking Matcher's own writes to those steps,
+     * for several seconds per batch.
+     */
+    private static final int MAX_BATCH_SIZE = 100;
+
     private final SlaTransitionFetchRepository transitionRepository;
     private final StepInstanceRepository stepInstanceRepository;
     private final DeviationRecorder deviationRecorder;
@@ -140,6 +170,13 @@ public class SlaTransitionApplier {
                                 @Value("${cce.sla.batch-size:100}") int batchSize,
                                 @Value("${cce.sla.max-backoff-seconds:3600}") long maxBackoffSeconds,
                                 MeterRegistry meterRegistry) {
+        if (batchSize > MAX_BATCH_SIZE) {
+            // Fail at startup, not at the first oversized batch in production. See MAX_BATCH_SIZE's
+            // Javadoc for the measurements behind this ceiling.
+            throw new IllegalArgumentException(
+                    "cce.sla.batch-size (%d) exceeds the maximum of %d — see SlaTransitionApplier.MAX_BATCH_SIZE"
+                            .formatted(batchSize, MAX_BATCH_SIZE));
+        }
         this.transitionRepository = transitionRepository;
         this.stepInstanceRepository = stepInstanceRepository;
         this.deviationRecorder = deviationRecorder;
@@ -320,6 +357,12 @@ public class SlaTransitionApplier {
      * never replace {@code MISSED} — which is what would happen if the two rows for a step were applied
      * out of order after a retry. {@code MET} is written only from null, so a step already found
      * {@code OVERDUE} cannot be relabelled as having been on time.
+     *
+     * <p>This check reads {@code step.getSlaStatus()} with no lock of its own, which would ordinarily be
+     * a race between two replicas each holding a different row of the same step. It is safe here only
+     * because {@link SlaTransitionFetchRepository#fetchTransitions} already holds this step under
+     * {@code FOR UPDATE} for the whole batch — no other replica can be concurrently reading or writing
+     * it. Do not call this method, or read a step loaded outside that fetch, without that lock in place.
      *
      * @return whether the status was written
      */
