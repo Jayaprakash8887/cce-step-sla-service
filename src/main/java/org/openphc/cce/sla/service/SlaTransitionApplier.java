@@ -316,10 +316,9 @@ public class SlaTransitionApplier {
      * Write {@code sla_status}, recording the transition in history, unless the step is already at a
      * status this one must not overwrite.
      *
-     * <p>Forward-only. {@code MET} and {@code MISSED} are settled outcomes, and {@code OVERDUE} must
-     * never replace {@code MISSED} — which is what would happen if the two rows for a step were applied
-     * out of order after a retry. {@code MET} is written only from null, so a step already found
-     * {@code OVERDUE} cannot be relabelled as having been on time.
+     * <p>Forward-only, by {@link SlaStatus#canReplace}: the enum holds the order, so {@code OVERDUE} can
+     * never replace {@code MISSED} after rows applied out of order on a retry, and {@code MET} is written
+     * only over null, so a step already found {@code OVERDUE} cannot be relabelled as on time.
      *
      * <p>This check reads {@code step.getSlaStatus()} with no lock of its own, which would ordinarily be
      * a race between two replicas each holding a different row of the same step. It is safe here only
@@ -331,7 +330,7 @@ public class SlaTransitionApplier {
      */
     private boolean writeSlaStatus(StepInstance step, SlaStatus newStatus) {
         SlaStatus currentStatus = step.getSlaStatus();
-        if (!canAdvance(currentStatus, newStatus)) {
+        if (!newStatus.canReplace(currentStatus)) {
             log.debug("Step {} is already {} — not writing {}", step.getId(), currentStatus, newStatus);
             return false;
         }
@@ -345,33 +344,6 @@ public class SlaTransitionApplier {
         log.info("Step {} (actionId={}) SLA {} -> {}",
                 step.getId(), step.getActionId(), currentStatus, newStatus);
         return true;
-    }
-
-    /**
-     * Whether {@code newStatus} may replace what the step already has.
-     *
-     * <p>{@code MET} is written only from null. It says the step beat its due date, which a step some
-     * deadline has already judged cannot be told retrospectively.
-     *
-     * <p>Every other outcome moves forward only, so {@code OVERDUE} can never replace {@code MISSED} —
-     * which is exactly what two rows for one step applied out of order after a retry would otherwise do.
-     */
-    private static boolean canAdvance(SlaStatus currentStatus, SlaStatus newStatus) {
-        if (newStatus == SlaStatus.MET) {
-            return currentStatus == null;
-        }
-        return rank(newStatus) > rank(currentStatus);
-    }
-
-    /** Ordering for the forward-only rule. Null is "not yet judged", so it precedes every outcome. */
-    private static int rank(SlaStatus status) {
-        if (status == null) {
-            return 0;
-        }
-        return switch (status) {
-            case OVERDUE -> 1;
-            case MISSED, MET -> 2;
-        };
     }
 
     /**
