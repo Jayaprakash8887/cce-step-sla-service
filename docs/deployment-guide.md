@@ -1,8 +1,28 @@
-# Deployment Guide — Compliance Service
+# Deployment Guide — Step SLA Service
 
 Deploy **last**. This service creates no tables and validates its JPA mapping at startup, so it will
 fail fast against a `ccedb` the other two services have not yet migrated. Ordering rationale:
 [Architecture Overview §6](../../cce-common-util/docs/architecture-overview.md#6-deployment-order).
+
+> **Upgrading to the `MET_CONDITION_REACHED` release: this service goes up before the new Matcher.**
+> The Matcher's `V3` migration admits a third `transition_type` and the Matcher then starts writing it.
+> A Step SLA Service from before this release cannot map that value — its fetch throws on the unknown
+> enum constant, the whole batch rolls back, and every batch holding such a row backs off. So:
+>
+> 1. Roll this service to the new version first. It stops sweeping `step_instance` for `MET`, so
+>    on-time completions sit at a null `sla_status` for the length of the gap — nothing is lost.
+> 2. Roll the Matcher. `V3` runs at its startup and seeds a `MET_CONDITION_REACHED` row for every step
+>    the sweep had not settled, so the gap drains on the next few cycles. `V4` follows it and deletes
+>    every row belonging to an optional step — expect `cce.sla.transitions.due` to drop, and expect the
+>    drop to be large on a database carrying protocols that gave optional actions a `tolerance-days`.
+>
+> Reverse the order and the old service jams on rows it cannot read. There is no version in which both
+> write `MET`, so there is no double-write to worry about either way.
+>
+> The same applies to **cce-compliance-service**, the 1.x service this one replaces: it maps the same
+> two transition types and would jam identically. It must be stopped before the new Matcher starts
+> writing `MET_CONDITION_REACHED` rows — which it should be regardless, since both services writing
+> `sla_status` is exactly what the 2.0.0 split ended.
 
 ## Requirements
 
@@ -10,7 +30,6 @@ fail fast against a `ccedb` the other two services have not yet migrated. Orderi
 |---|---|
 | JRE | 21 |
 | PostgreSQL | 16, database `ccedb` — schema already applied by the Protocol and Matcher services |
-| Kafka | producer only — `cce.intelligence.triggers` must exist or be auto-creatable |
 | Memory | 1 GB heap is comfortable |
 
 The database user needs **no DDL rights**. If it has them, that is a wider grant than this service
@@ -25,9 +44,10 @@ production:
 |---|---|---|
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | |
 | `DB_USERNAME` / `DB_PASSWORD` | `cce_user` / `cce_pass` | never leave at the default |
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | |
+| `DB_POOL_SIZE` | `3` | per replica; size the database's connection limit as replicas × this |
 | `CCE_SLA_INSTANCE_ID` | `$HOSTNAME` | **set this per replica** — it lands in `processed_by` |
-| `CCE_SLA_POLL_INTERVAL_MS` | `5000` | |
+| `SPRING_PROFILES_ACTIVE` | — | **set to `prod`** — raises the poll interval to 15s |
+| `CCE_SLA_POLL_INTERVAL_MS` | `5000`, `15000` under `prod` | overrides either |
 | `CCE_SLA_BATCH_SIZE` | `100` | |
 
 `CCE_SLA_INSTANCE_ID` defaults to `$HOSTNAME`, which is already distinct per pod in Kubernetes. Set it
@@ -41,18 +61,17 @@ misbehaving replica.
 context:
 
 ```bash
-cd ..            # the directory containing cce-compliance-service and cce-common-util
-docker build -f cce-compliance-service/Dockerfile -t cce-compliance-service:2.0.0 .
+cd ..            # the directory containing cce-step-sla-service and cce-common-util
+docker build -f cce-step-sla-service/Dockerfile -t cce-step-sla-service:2.0.0 .
 ```
 
 ```bash
-docker run -d --name cce-compliance-service \
+docker run -d --name cce-step-sla-service \
   -p 8092:8080 \
   -e DB_HOST=postgres-host -e DB_PORT=5433 \
   -e DB_USERNAME=cce_user -e DB_PASSWORD='<secret>' \
-  -e KAFKA_BOOTSTRAP_SERVERS=kafka-host:9092 \
-  -e CCE_SLA_INSTANCE_ID=compliance-1 \
-  cce-compliance-service:2.0.0
+  -e CCE_SLA_INSTANCE_ID=step-sla-1 \
+  cce-step-sla-service:2.0.0
 ```
 
 The image pins `SERVER_PORT=8080` to match its `EXPOSE` and healthcheck; the application's own default
@@ -64,28 +83,28 @@ outside Docker is `8092`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: cce-compliance-service
+  name: cce-step-sla-service
 spec:
   replicas: 2
   selector:
-    matchLabels: { app: cce-compliance-service }
+    matchLabels: { app: cce-step-sla-service }
   template:
     metadata:
-      labels: { app: cce-compliance-service }
+      labels: { app: cce-step-sla-service }
     spec:
       containers:
-        - name: cce-compliance-service
-          image: cce-compliance-service:2.0.0
+        - name: cce-step-sla-service
+          image: cce-step-sla-service:2.0.0
           ports: [{ containerPort: 8080 }]
           env:
+            - { name: SPRING_PROFILES_ACTIVE, value: prod }
+            - { name: SERVER_PORT, value: "8080" }
             - name: CCE_SLA_INSTANCE_ID
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: DB_HOST
               value: postgres.cce.svc.cluster.local
             - { name: DB_USERNAME, valueFrom: { secretKeyRef: { name: cce-db, key: username } } }
             - { name: DB_PASSWORD, valueFrom: { secretKeyRef: { name: cce-db, key: password } } }
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              value: kafka.cce.svc.cluster.local:9092
           readinessProbe:
             httpGet: { path: /actuator/health/readiness, port: 8080 }
             initialDelaySeconds: 20
@@ -106,14 +125,9 @@ database-bound, and a backlog is visible in that gauge long before it shows up a
 
 ## Kafka
 
-Produce-only. One topic:
-
-| Topic | Direction |
-|---|---|
-| `cce.intelligence.triggers` | produce |
-
-No consumer group, no DLQ, no inbound topic. If you find a consumer group named after this service on
-the broker, it is a leftover from the pre-split monolith and can be deleted.
+None. This service neither consumes nor produces: no topic, no consumer group, no DLQ. If you find a
+consumer group named after this service on the broker, it is a leftover from the pre-split monolith and
+can be deleted.
 
 ## Event Replay — sequencing the two services
 
@@ -123,7 +137,7 @@ outage that left its consumer group far behind.
 
 **This service must be stopped for the duration.** Running it against an unmatched backlog makes it
 record `OVERDUE` and `MISSED` against steps whose completing event has not been processed yet — and
-neither those verdicts nor the clinician alerts they trigger can be withdrawn. The mechanism, and why
+the service never revises those verdicts. The mechanism, and why
 stopping costs nothing, is in
 [Architecture — Operational prerequisite](architecture-overview.md#operational-prerequisite--event-replay).
 
@@ -132,7 +146,7 @@ stopping costs nothing, is in
 **1. Stop this service.**
 
 ```bash
-kubectl scale deployment/cce-compliance-service --replicas=0
+kubectl scale deployment/cce-step-sla-service --replicas=0
 ```
 
 There is no in-process pause switch — the `@Scheduled` poll has no guard — so scaling to zero (or
@@ -152,7 +166,7 @@ read. Wait a few minutes at zero before continuing; a late burst is easy to miss
 **3. Start this service.**
 
 ```bash
-kubectl scale deployment/cce-compliance-service --replicas=1
+kubectl scale deployment/cce-step-sla-service --replicas=1
 ```
 
 **4. Watch the drain.** `cce.sla.transitions.due` starts high — every deadline that fell during the
@@ -168,7 +182,6 @@ There is no automatic correction, and it is worth being blunt about what that me
 |---|---|
 | `sla_status` = `OVERDUE` / `MISSED` on a step that was on time | Only by a manual data fix — the service will not revise it, since writes are forward-only and `MET` is written only over a null |
 | The `OVERDUE` / `MISSED` deviation row | Only by deleting it manually |
-| The intelligence event on `cce.intelligence.triggers` | **No.** It has been delivered |
 
 This query finds the affected steps — ones whose recorded breach disagrees with the `completed_at`
 that arrived afterwards:
@@ -191,8 +204,7 @@ legitimately `OVERDUE` for completing late would also match, because its missed-
 
 A row here means the verdict was reached before the completion was known. It is not proof of a missed
 Event Replay — any backdated event arriving after its deadline produces the same shape — but after a
-replay this is the list to work from. What to do about an alert already sent is a clinical call, not a
-technical one.
+replay this is the list to work from.
 
 ## Health checks & monitoring
 
@@ -202,46 +214,52 @@ technical one.
 | `/actuator/health/liveness` | Restart decisions |
 | `/actuator/prometheus` | Scrape target |
 
-Note what readiness does **not** cover: the scheduler. A pod can be ready and serving the read API
-while its SLA sweep is stalled. The metrics to alert on are `cce.sla.transitions.due` and
-`cce.sla.steps.on-time-unsettled` — see
-[Architecture §6](architecture-overview.md#6-observability) for how to read them alongside
+Scrape every 60s rather than the 15s global default. Each scrape evaluates the
+`cce.sla.transitions.due` gauge, which is one database query per replica (an index-only scan on
+`idx_sslt_due`, about 0.2 ms in steady state), and a backlog signal needs no finer resolution than
+that:
+
+```yaml
+- job_name: "cce-step-sla-service"
+  metrics_path: /actuator/prometheus
+  scrape_interval: 60s
+  static_configs:
+    - targets: ["cce-step-sla-service:8080"]
+```
+
+Note what readiness does **not** cover: the scheduler. A pod can report ready while its SLA sweep is
+stalled. The metric to alert on is `cce.sla.transitions.due` — see
+[Architecture §6](architecture-overview.md#6-observability) for how to read it alongside
 `evaluator.cycles` and `batches.failed`.
 
-**The two sweeps fail independently, and only one of them is counted.** `poll()` runs the breach sweep
-and the on-time sweep in separate `try`/`catch` blocks, deliberately, so a failure in one cannot stop
-the other. But `evaluator.cycles` and `evaluator.batches.failed` are incremented by the breach sweep
-alone. An on-time sweep that throws on every cycle therefore leaves `cycles` climbing normally,
-`batches.failed` flat and `transitions.due` at zero, while no completion is ever recorded `MET`.
-`cce.sla.steps.on-time-unsettled` rising is the only signal there is, which is why it belongs on the
-alert list and not just on a dashboard.
+One sweep now reaches every verdict, `MET` included, so there is a single failure mode to watch rather
+than two with different symptoms: a stalled service shows as `transitions.due` rising, whatever kind of
+row is piling up behind it.
 
 Suggested alerts:
 
 | Condition | Meaning |
 |---|---|
-| `cce.sla.transitions.due` rising for > 15 min | the breach sweep is not keeping up |
-| `cce.sla.steps.on-time-unsettled` rising for > 15 min | on-time completions are not being recorded `MET` — the second sweep is stalled |
+| `cce.sla.transitions.due` rising for > 15 min | the sweep is not keeping up — breaches, on-time completions or both |
 | `cce.sla.evaluator.batches.failed` increasing | rows are failing and backing off |
 | `cce.sla.evaluator.cycles` flat | the scheduler thread has stopped — liveness will not catch this |
 
 ## Backup
 
-This service owns no tables, so there is nothing here to back up. `step_sla_state_transition`,
-`deviation` and `intelligence_event_log` are covered by the Matcher Service's backup.
+This service owns no tables, so there is nothing here to back up. `step_sla_state_transition`
+and `deviation` are covered by the Matcher Service's backup.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
 | Startup fails: schema validation error | Deployed out of order — the Protocol and Matcher services must migrate `ccedb` first |
+| Every batch rolls back with `No enum constant … MET_CONDITION_REACHED` | An old build of this service against a post-`V3` database. Roll this service forward; see the upgrade note at the top |
 | `due` gauge rising, `cycles` incrementing | Sweep running but not keeping up — add replicas or raise `batch-size` |
 | `due` rising, `batches.failed` rising | Rows failing and backing off; check the logs for the rolled-back batch |
 | `cycles` not incrementing | Scheduler stopped; restart the pod. Liveness will not detect this |
-| Deviations recorded but no intelligence delivered | Check `?published=false` on the [read API](api-reference.md#get-v1complianceintelligence-events) — the trigger may be built but unconfirmed |
-| The same alert delivered repeatedly | A transition retrying against an already-recorded deviation should be de-duplicated ([Architecture §5](architecture-overview.md#5-intelligence-on-deviation)); check `attempts` on the row |
 | A completed step is `OVERDUE` / `MISSED` although its `completed_at` beat the threshold | The row was judged before the Matcher Service had matched the completing event — the [Event Replay](#event-replay--sequencing-the-two-services) sequence was not held. Not self-correcting |
 | A step's `sla_status` looks wrong for a completed step | This service is its **only** writer — Matcher records `step_status` and `completed_at` and never judges timeliness. Compare `completed_at` against the row's `process_by` ([Architecture §4](architecture-overview.md#4-what-the-applier-does)) |
-| A completed step stays at a null `sla_status` | It has no `due_date`, so nothing judges it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |
+| A completed step stays at a null `sla_status` | It is optional, or it is a 1.x row with no `due_date`, so nothing schedules a verdict for it: `MET` requires a deadline to have been beaten. Null is terminal here and correct |
 | A settled step still has an unprocessed `MISSED_DATE_REACHED` row | Expected, not a stuck row. A row is taken when its own deadline arrives, so a step completed before its missed date keeps that row until the date passes — then it is consumed and records nothing |
-| `on-time-unsettled` rising while `due` sits at zero | The on-time sweep is failing; look for `On-time settlement cycle failed` in the logs. The breach sweep is unaffected, so `cycles` and `batches.failed` look healthy |
+| A step completed well before its due date is still null | Its `MET_CONDITION_REACHED` row has not been applied yet, or was never written — Matcher writes it at completion, and only for a mandatory step with a `due_date` |

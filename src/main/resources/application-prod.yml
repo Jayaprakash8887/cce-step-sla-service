@@ -1,0 +1,16 @@
+# ==============================================================================
+# CCE Step SLA Service — Production Profile
+# ==============================================================================
+# Activate with: SPRING_PROFILES_ACTIVE=prod
+# or: java -jar app.jar --spring.profiles.active=prod
+
+cce:
+  sla:
+    # 15s rather than the 5s default. Each tick is a fetch that joins step_instance under FOR UPDATE, run
+    # by every replica, so in production the steady-state cost is worth trading for detection delay: a
+    # newly-due transition, including a MET, is judged up to 15s after it falls due instead of 5s.
+    #
+    # A fixed delay, not a fixed rate: the 15s is counted from the end of one cycle to the start of the
+    # next, so cycles never overlap. Within a cycle, batches run back to back until one comes back short,
+    # so a backlog drains without waiting between batches and this does not lower throughput.
+    poll-interval-ms: ${CCE_SLA_POLL_INTERVAL_MS:15000}

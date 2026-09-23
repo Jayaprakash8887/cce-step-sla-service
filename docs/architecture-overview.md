@@ -1,4 +1,4 @@
-# Architecture & Design — Compliance Service
+# Architecture & Design — Step SLA Service
 
 > The time plane: what happens because a deadline passed or was beaten — never because an event
 > arrived.
@@ -44,13 +44,14 @@ During an Event Replay the two do not merely race occasionally; they collide by 
 4. **Nothing corrects step 2**, and each reason is deliberate:
    - `sla_status` writes are forward-only, and `MET` is written only over a null, so a step recorded
      `OVERDUE` can never become `MET`.
-   - The on-time sweep considers only steps with `sla_status IS NULL`, so it never revisits this one.
-   - The deviation row already exists and is de-duplicated, so it is not reconsidered.
-   - The intelligence actions already fired and were published to `cce.intelligence.triggers`. **A
-     clinician has already been alerted.**
+   - The `MET_CONDITION_REACHED` row Matcher writes when it finally reaches the event is applied
+     against a step that is no longer null, so it records nothing.
+   - The deviation row stays: nothing withdraws it, and the step's status cannot be written again to
+     raise it a second time.
 
-That last point is what makes this a prerequisite rather than a preference. A wrong `sla_status` and a
-spurious deviation can in principle be repaired by a data fix; a delivered alert cannot be recalled.
+What makes this a prerequisite rather than a preference is that nothing notices. A wrong verdict is not
+an error the service reports — it is an ordinary-looking `sla_status` and deviation, and undoing it is
+a manual data fix against every affected step.
 
 ### Why stopping is safe
 
@@ -79,18 +80,17 @@ Everything the schedule drives — and the one verdict that needs no schedule at
 3. Write `step_instance.sla_status` — `OVERDUE` and `MISSED` from (1), `MET` from (2). This service is
    its only writer.
 4. Record the resulting `OVERDUE` / `MISSED` deviations. On-time work breached nothing and records none.
-5. Evaluate the intelligence actions those deviations trigger, and publish them.
 
 The split between (1) and (2) is the shape of the whole service. A breach is measured against a
 schedule, so a row has to come round for it. Timeliness is a statement about the step, answerable from
 its own `completed_at` and `due_date` as soon as the completion lands — no threshold need fall for
 `MET` to be known. §3 is how both are driven.
 
-It also exposes a read API over `intelligence_event_log`.
-
-**What it does not do**: match inbound events, enrol patients, create or complete steps, or manage
-definitions. It has no Kafka consumer — nothing inbound reaches it. `ORDER_VIOLATION` deviations stay
-with the Matcher Service, which detects them at completion from the event itself.
+**What it does not do**: match inbound events, enrol patients, create or complete steps, manage
+definitions, or evaluate intelligence actions on the deviations it records
+([§5](#5-intelligence-on-deviation)). It uses no Kafka — nothing inbound reaches it and it publishes
+nothing. `ORDER_VIOLATION` deviations stay with the Matcher Service, which detects them at completion
+from the event itself.
 
 ## 2. Owns no tables
 
@@ -106,25 +106,25 @@ Deploy **last**. Table ownership and the full ordering rationale:
 
 ## 3. The fetch-and-apply cycle
 
-Every cycle runs **two independent sweeps**. The first fetches a batch of
-`step_sla_state_transition` rows whose deadline has passed and applies them; that is where a breach is
-detected. The second sweeps `step_instance` for steps that beat their due date and records them as
-`MET`.
+Every cycle runs **one sweep**, over `step_sla_state_transition`: fetch a batch of rows that have come
+round, apply each, repeat until a batch comes back short. Every verdict this service reaches comes from
+a row, `MET` included.
 
-They are separate because they answer different questions from different evidence. A breach is a
-schedule's business — it happens at a deadline, so a row has to come round. Whether work was recorded
-*on time* needs no schedule at all: `completed_at` against `due_date`, both on the step. The second
-sweep therefore runs whether or not the first found anything, and a failure in one does not stop the
-other.
+The three row types differ only in what they ask. `DUE_DATE_REACHED` and `MISSED_DATE_REACHED` are
+deadlines: they become due when their threshold falls, and what they detect is a breach.
+`MET_CONDITION_REACHED` is a condition already satisfied — Matcher writes it at the moment a completing
+event lands before the step's due date, with `process_by` equal to that `completed_at` — so it is due
+the instant it exists and the verdict is reached on the next cycle.
 
-Read them as **two sweeps, not two stages**. They query different tables, neither uses the other's
-results, and they run one after the other only because a single thread drives both. The order carries no
-more meaning than "a breach is the more pressing news".
+That last point is what makes one sweep possible. `MET` used to need a scan of `step_instance`, because
+a schedule could only fire at a deadline and an early completion would otherwise read as null until a
+due date weeks away. Scheduling the answer at the completion removes both the scan and the second code
+path.
 
 ```mermaid
 flowchart TD
     S["Scheduled poll<br/>every cce.sla.poll-interval-ms"]
-      --> D["FetchDueTransitions(now, batchSize)<br/>rows whose deadline has passed"]
+      --> D["FetchTransitions(now, batchSize)<br/>is_processed = false, next_attempt_at &lt;= now<br/>deadlines that fell · completions recorded on time"]
     D --> E{"any rows fetched?"}
     E -->|"none"| Z["sweep ends — one empty query"]
     E -->|"some"| A["apply each row<br/>same transaction as the fetch"]
@@ -134,58 +134,47 @@ flowchart TD
     A -.->|"transaction rolled back"| B["backOff(ids)<br/>REQUIRES_NEW"]
 ```
 
-Then the second sweep, over `step_instance` and nothing else:
+`MET` is written one row at a time rather than as a single `UPDATE`, like every other verdict, because
+`step_instance_history` has to carry every `sla_status` transition and a set update would leave a gap
+exactly where a step went on time.
 
-```mermaid
-flowchart TD
-    S2["same poll, after the sweep above<br/>runs whether or not that one found work"]
-      --> Q["FetchOnTimeSteps(batchSize)<br/>step_status = COMPLETED<br/>sla_status IS NULL<br/>completed_at &lt; due_date"]
-    Q --> E2{"any steps fetched?"}
-    E2 -->|"none"| Z2["sweep ends"]
-    E2 -->|"some"| W["write MET on each<br/>+ a step_instance_history row"]
-    W --> F2{"batch full?"}
-    F2 -->|"yes"| Q
-    F2 -->|"short"| Z2
-```
-
-**No back-off path, and nothing to mark processed.** `sla_status IS NULL` is both the filter and the
-idempotency record: writing `MET` takes a step out of the set for good, and a batch that rolls back
-leaves it in, to be picked up next cycle. There is no per-row attempt count because there is no row —
-the step itself is the work item. That is the simplification driving off the step buys.
-
-`MET` is written one step at a time rather than as a single `UPDATE`, because `step_instance_history`
-has to carry every `sla_status` transition and a set update would leave a gap exactly where a step went
-on time.
-
-The two fetches live on separate repositories — `SlaTransitionFetchRepository` and
-`OnTimeStepFetchRepository` — and both are kept out of cce-common-util's shared read side deliberately.
-Fetching rows to act on, and the pessimistic lock that comes with it, is this service's alone; the
-shared repositories are the read side another service could reach for.
+The fetch lives on `SlaTransitionFetchRepository`, kept out of cce-common-util's shared read side
+deliberately. Fetching rows to act on, and the pessimistic lock that comes with it, is this service's
+alone; the shared repositories are the read side another service could reach for.
 
 ### Step by step
 
-**Scheduled poll** — a Spring `fixedDelay` timer, default 5s, is the only thing that starts work in this
+**Scheduled poll** — a Spring `fixedDelay` timer (5s by default, 15s under the `prod` profile; the delay runs from the end of one cycle to the start of the next) is the only thing that starts work in this
 service. `poll()` catches everything `evaluateDue()` throws, because an exception escaping a
 `@Scheduled` method stops the schedule. Every replica runs its own timer.
 
-**`fetchDueTransitions(now, batchSize)`** — the only query that brings a transition row in. Fetches rows
-where `is_processed = false AND next_attempt_at <= now`, ordered by `process_by`, under
-`FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2` timeout hint Hibernate translates to
-`SKIP LOCKED`). The predicate selects on `next_attempt_at` rather than `process_by`: the two are equal
-when the Matcher Service writes the row, and a failure pushes `next_attempt_at` out so a retry is
-deferred without rewriting `process_by`, which stays the immutable record of when the deadline fell. The
-partial index `idx_sslt_due` covers exactly this predicate, so the scan touches only the unprocessed
-backlog.
+**`fetchTransitions(now, batchSize)`** — the only query that brings a transition row in. Fetches rows
+where `is_processed = false AND next_attempt_at <= now AND process_by <= now`, ordered by `process_by`,
+under `FOR UPDATE SKIP LOCKED` (a `PESSIMISTIC_WRITE` lock with the `-2` timeout hint Hibernate translates
+to `SKIP LOCKED`). The `next_attempt_at` predicate is the real gate: it equals `process_by` when Matcher
+writes the row, and a failure pushes it out so a retry is deferred without rewriting `process_by`, which
+stays the immutable record of when the deadline fell. The `process_by <= now` bound is redundant with it
+(`next_attempt_at` is never earlier), but paired with the partial index `idx_sslt_due_order` (on
+`process_by`, a Matcher migration) it lets Postgres walk that index in `ORDER BY` order and stop after
+one batch, instead of reading and sorting the whole due backlog to return the top `batchSize`.
 
-Note what it does *not* read: this is a single-table query with no join to `step_instance`, so it knows
-nothing about whether the step completed. Eligibility here is purely "this row's gate has passed"; what
-the row *means* is decided later, in the apply.
+**The fetch also fetches `step_instance`, under the same lock.** A step has up to three transition rows
+(its two thresholds and its `MET_CONDITION_REACHED`), and locking `step_sla_state_transition` rows alone
+only protects one row at a time — two replicas could each claim a different row of the *same* step and
+judge it concurrently, racing on `step_instance.sla_status`. `JOIN FETCH t.stepInstance` brings
+`step_instance` under the same `FOR UPDATE`/`SKIP LOCKED` semantics (Hibernate emits `... join
+step_instance ... for no key update skip locked`, with no `OF` list), with no change to what the row's
+eligibility means: a step is now held by exactly one replica for as long as that replica's batch
+transaction runs. `MAX_BATCH_SIZE` (§7) bounds how long that hold can last. The same query hands the
+applier every step it judges, so a batch is one query however large it grows, and a step's rows in one
+batch share a single managed instance. It has to stay a *fetch* join: a bare `JOIN t.stepInstance`
+selects nothing from the step and is pruned from the SQL, taking the step's lock with it.
 
 **any rows fetched?** — zero is the steady state: one empty indexed query per interval, and the cycle
 ends.
 
 **apply each row** — per row: increment `attempts` (past five, the row is logged as an error every cycle
-rather than failing quietly), load the step, decide whether the threshold was breached, write
+rather than failing quietly), take the step the fetch brought with it, decide whether the threshold was breached, write
 `sla_status` forward-only, record the deviation if there is one, mirror the write into
 `step_instance_history`, and mark the row processed with `processed_by`. §4 covers the judgement itself.
 Each fetched id is also appended to a list the evaluator holds — plain memory rather than transactional
@@ -207,11 +196,13 @@ likely to break the next one too. See [Retry](#retry) for the backoff itself.
 
 Three properties make this safe without any coordination machinery:
 
-**The row lock is what reserves the row.** `FOR UPDATE SKIP LOCKED` means a row locked by one replica is
-*invisible* to the others rather than contended, so every replica can poll the same table concurrently.
-There is no lease table, no heartbeat, and no leader election. A replica that dies mid-batch drops its
-connection, its locks release, and the work is immediately available again — no lease expiry to wait
-out.
+**The row lock is what reserves the row — and, since the fetch joins it, the step too.**
+`FOR UPDATE SKIP LOCKED` means a row (or a step) locked by one replica is *invisible* to the others
+rather than contended, so every replica can poll the same table concurrently. There is no lease table, no
+heartbeat, and no leader election. A replica that dies mid-batch drops its connection, its locks release,
+and the work is immediately available again — no lease expiry to wait out. The trade-off is that a step
+tied to a row in the batch is held for the whole of that transaction, whether or not the row ends up
+writing anything, which is why `cce.sla.batch-size` is capped (§7) rather than left unbounded.
 
 **Fetch and apply share one transaction.** Fetching in one transaction and applying in another would
 leave a window where a row is marked taken but not yet acted on, and a crash inside that window makes
@@ -225,35 +216,22 @@ interval. `MAX_BATCHES_PER_CYCLE` (100) stops a pathological backlog from monopo
 `ORDER BY process_by ASC` means the oldest deadline is always handled first, so a backlog degrades by
 latency rather than by dropping the most overdue work.
 
-The on-time sweep has two steps of its own:
+A `MET_CONDITION_REACHED` row needs no predicate of its own here. Its `process_by` is the
+`completed_at` that satisfied it, which is already in the past when Matcher writes the row, so it is
+fetched on the next cycle along with any deadline that has fallen. Ordering by `process_by` puts it in
+clinical-time order with the rest — a completion recorded two weeks late, on a backdated event, is
+settled before a deadline that fell this morning.
 
-**`fetchOnTimeSteps(batchSize)`** — a single-table read of `step_instance`, no join and no schedule
-consulted: `step_status = COMPLETED AND sla_status IS NULL AND completed_at < due_date`, with both
-timestamps required non-null, ordered by `completed_at` so the longest-waiting step is recorded first.
-It takes the same `FOR UPDATE SKIP LOCKED` as the transition fetch, so every replica can sweep the
-table at once and one that dies mid-batch releases its rows immediately.
+**Applying one**: the judgement is made here, from the step, not taken on the row's word. The row says
+"this step looks on time, go and decide"; the applier checks `step_status = COMPLETED`,
+`completed_at` and `due_date` both present, and `completed_at < due_date` strictly — work landing
+exactly on the deadline did not beat it. If that still holds, `sla_status = MET` and the matching
+`step_instance_history` row go through the same forward-only `writeSlaStatus` every other verdict uses.
+No deviation is recorded: there is nothing deviant about work done on time.
 
-Each predicate is load-bearing. `COMPLETED`, because only recorded work can have been on time.
-`sla_status IS NULL`, because that is the whole of the sweep's bookkeeping — and because `MET` is
-written over a null and nothing else, so a step already judged is not this sweep's to relabel.
-`completed_at < due_date` strictly, because that comparison *is* the question, and work landing exactly
-on the deadline did not beat it. And `due_date IS NOT NULL`, which excludes a step created from its own
-trigger: it has no deadline to have beaten, so its `sla_status` stays null.
-
-The query reads the null half of `idx_step_instance_completed_unjudged`, whose partial predicate spans
-both unsettled statuses (`sla_status IS NULL OR sla_status = 'OVERDUE'`). Only the null half has a
-consumer, so the `OVERDUE` half is dead weight the shared schema could drop. Either way the scan covers
-the completed-but-unsettled set rather than every step ever created, and a step matches at most once —
-the `MET` it gets is what removes it from the set, and a sweep empties what has accumulated.
-
-Driving it the other way — scanning pending `DUE_DATE_REACHED` rows and checking each step — would mean
-walking the entire future schedule every few seconds to find the few steps that finished early.
-
-**write `MET` on each** — per step: `sla_status = MET` and the matching `step_instance_history` row,
-through the same forward-only `writeSlaStatus` every other write goes through. No deviation is
-recorded, so nothing here reaches the intelligence evaluation of §5 — there is nothing deviant about
-on-time work. A step that somehow arrives already settled has its write refused and is counted
-consumed rather than applied.
+If it does not hold — a step whose columns changed under the row, or a status already settled by a
+deadline that got there first — the row records nothing and is consumed. That split is deliberate: the
+Matcher schedules the question, this service answers it, and neither can write the other's column.
 
 The step's own pending `DUE_DATE_REACHED` row is left alone. It is fetched when its schedule comes
 round, finds the step settled, and is consumed then. It stays out of the backlog gauge in the meantime,
@@ -264,8 +242,9 @@ because that gauge counts only rows whose `next_attempt_at` has passed.
 A row becomes ready when `next_attempt_at` passes. That is the whole of it — there is no second way in,
 and nothing pulls a step's remaining rows forward because the step completed or was judged.
 
-So a settled step keeps its unspent schedule until those dates arrive. A step recorded `MET` by the
-on-time sweep, or `OVERDUE` by its own due-date row, still holds a pending `MISSED_DATE_REACHED` row; it
+So a settled step keeps its unspent schedule until those dates arrive. A step recorded `MET` by its
+`MET_CONDITION_REACHED` row, or `OVERDUE` by its due-date row, still holds a pending
+`MISSED_DATE_REACHED` row; it
 is fetched when its date comes round, finds the threshold kept or the status already past it, records
 nothing, and is consumed. The row is disposed of late rather than early, and the step's `sla_status` is
 the same either way.
@@ -298,17 +277,18 @@ The judgement compares `step_instance.completed_at`, the clinical occurrence tim
 event, against the threshold the row stands for. The wall clock is not consulted: all that remains to
 ask is whether the work had happened by then.
 
-**A breach is all a transition row decides.** `OVERDUE` and `MISSED` are measured against its
-`process_by` — the schedule exists to detect a breach, and the row carries it.
+**A breach is measured against the row's `process_by`.** `OVERDUE` and `MISSED` exist because a
+deadline fell, and the row carries the deadline.
 
-**`MET` is not decided here at all.** It is settled by the second sweep, from
-`step_instance.completed_at` against `step_instance.due_date`, with no row involved. So a due-date row
-whose threshold was kept records nothing: it is consumed, and the step's timeliness is the other
-sweep's to state.
+**`MET` is measured against the step's `due_date`.** A `MET_CONDITION_REACHED` row says work was
+recorded early; the applier confirms it against `step_instance.due_date`, not against the row's own
+`process_by`, which holds the `completed_at` that prompted it. So a *due-date* row whose threshold was
+kept still records nothing — the step's `MET` row is where that verdict lives, and it was reached when
+the work landed.
 
-The two columns normally hold the same instant — the Matcher writes `due_date` and the
-`DUE_DATE_REACHED` row's `process_by` from one value in one transaction — but they are answering to
-different owners, and only `due_date` is a statement about the work.
+`due_date` and the `DUE_DATE_REACHED` row's `process_by` normally hold the same instant — the Matcher
+writes both from one value in one transaction — but they answer to different owners, and only
+`due_date` is a statement about the work.
 
 | Row | Step when applied | `sla_status` | Deviation |
 |---|---|---|---|
@@ -318,8 +298,9 @@ different owners, and only `due_date` is a statement about the work.
 | `MISSED_DATE_REACHED` | not completed | `MISSED` | `MISSED` |
 | `MISSED_DATE_REACHED` | `completed_at >= process_by` | `MISSED` | `MISSED` |
 | `MISSED_DATE_REACHED` | `completed_at < process_by` | *unchanged* | — |
+| `MET_CONDITION_REACHED` | `completed_at < due_date` | `MET` | — |
+| `MET_CONDITION_REACHED` | anything else | *unchanged* | — |
 
-A step whose row no longer exists is consumed rather than retried: there is no schedule left to honour.
 A step marked `COMPLETED` with no `completed_at` is treated as a breach — the row is better evidence
 than a missing timestamp, and letting it pass would hide the gap instead of surfacing it. That rule
 needs no clock to justify it: a row is only ever applied once its own threshold has passed, so a step
@@ -331,14 +312,16 @@ The two *unchanged* table rows are worth being careful about. A step completed b
 breached neither the missed date nor — if it landed before `process_by` — the due-date row's schedule.
 Neither is a statement that it was on time.
 
-This is why no transition row writes `MET`. "Did not breach this threshold" and "met its SLA" are
-different claims, and a row that reported the first as the second would relabel a late completion as
-on time. Timeliness is asked of the step, once, by the on-time sweep: `completed_at < due_date`, or
-nothing.
+This is why *these* rows never write `MET`. "Did not breach this threshold" and "met its SLA" are
+different claims, and a row that reported the first as the second would relabel a late completion as on
+time. Timeliness is asked once, on its own row, against the step's `due_date` — and a step completed
+between its thresholds never gets such a row, because Matcher only writes one for work that landed
+before the due date.
 
-A step with no `due_date` is therefore never recorded `MET`. It has no deadline to have beaten — a step
-created from its own trigger is the usual case — so its `sla_status` stays null, which is what null
-means.
+A step with no `due_date` is therefore never recorded `MET`. It has no deadline to have beaten, so no
+`MET_CONDITION_REACHED` row is written for it and its `sla_status` stays null, which is what null means.
+In practice that is a row carried over from 1.x: every step the current Matcher creates is given a due
+date, a step created from its own trigger being stamped with the moment it was created.
 
 Writes are **forward-only** for the same reason. `MET` and `MISSED` are settled outcomes, and `OVERDUE`
 must never replace `MISSED` — which is exactly what a retry applying a step's two rows out of order
@@ -346,17 +329,33 @@ would otherwise do.
 
 ### Optional steps
 
-A `MISSED` status and a `MISSED` deviation are both **`must`-only** — the rule the shared
-[Data Dictionary](../../cce-common-util/docs/data-dictionary.md#deviationtype) states. Nothing was
-required of an optional (`could`) step, so nothing was breached by its not happening.
+**Only mandatory steps have deadlines.** A deadline is the point at which work the protocol *required*
+has not been recorded, so only a step the protocol required can breach one. That is now enforced where
+schedules are written rather than where they are judged:
 
-The exemption applies on **both** the completed and the outstanding path, which is the part worth being
-deliberate about: an optional step recorded *after* its missed threshold gets no `MISSED` deviation
-either. Exempting only the step that never arrived would penalise doing optional work late more heavily
-than not doing it at all.
+* The Protocol Service **rejects a PlanDefinition** whose optional action declares `tolerance-days`
+  (`PlanDefinitionParser.validateOptionalStepDeadlines`). An author who wants the deadline declares
+  `requiredBehavior: "must"`.
+* The Matcher Service **writes no `step_sla_state_transition` row** for an optional step, whatever
+  thresholds it was created with (`StepSlaScheduleService.schedule`). This is the enforcement that
+  holds for protocols loaded before the check existed.
 
-The exemption is `MISSED`-only. An optional step still takes an `OVERDUE` when it passes its due date:
-"running late" is a reportable fact about optional work, "breached" is not.
+Mandatory is `requiredBehavior == "must"` and nothing else — an absent value states no requirement, so
+it is optional exactly as `could` is. `RequiredBehavior.isMandatory` is the single definition, shared by
+progressive instantiation, SLA scheduling and the judgement here, so a step cannot be required by one
+rule and optional by the next.
+
+A row for an optional step can therefore only be one written before those rules — and the Matcher's `V4`
+migration deleted those, including the ones `V2`'s upgrade backfill seeds, so the table holds mandatory
+rows only. The applier still **consumes** any it meets, recording no `sla_status` and no deviation
+whatever the row stands for, and logs it as a stale schedule. That check sits ahead of the type dispatch, so it covers `MET_CONDITION_REACHED` as well as
+the two deadlines: the rule is enforced where rows are written *and* where they are judged, so neither
+side alone has to be trusted.
+
+`MET` follows the same rule, now that it comes from a row too: Matcher writes no
+`MET_CONDITION_REACHED` for an optional step and the applier would decline one anyway, so an optional
+step reaches no SLA verdict at all and its `sla_status` stays null. That is the consequence of having no deadline — there is no due date it can be
+said to have beaten, just as there is none it can breach.
 
 ### What it does not write
 
@@ -385,31 +384,27 @@ the data.
 
 ## 5. Intelligence on deviation
 
-When a deviation is newly recorded — not when it already existed — the shared
-[`IntelligenceActionEvaluator`](../../cce-common-util/docs/library-reference.md#intelligence--intelligenceactionevaluator)
-evaluates the step's intelligence actions and publishes any that fire to
-`cce.intelligence.triggers`.
+Not part of this service yet. A breach records its deviation ([§4](#4-what-the-applier-does)) and
+nothing further happens: no intelligence action is evaluated and nothing is published.
 
-The de-duplication matters: without it, a transition retried after a failure would re-trigger an alert
-a clinician has already received. `DeviationRecorder` reports whether the row was new, and the
-evaluation is gated on that.
-
-This service is **produce-only** on Kafka. Its `KafkaConfig` declares a producer factory, a template
-and the outbound topic — no consumer factory, no listener container, no DLQ, because nothing is
-consumed.
+cce-common-util still ships that machinery — `IntelligenceActionEvaluator` and the Kafka producer it
+publishes through — so the application class keeps it out explicitly. It filters the library's
+`intelligence` and `kafka` packages from component scanning, and excludes Kafka auto-configuration
+because spring-kafka still reaches the classpath through that library. Without both, those beans would
+be created anyway, with a Kafka producer to back them. `ApplicationContextTest` fails if either
+exclusion is lost.
 
 ## 6. Observability
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `cce.sla.transitions.due` | gauge | rows the next cycle would fetch: unprocessed, with `next_attempt_at` already passed — the primary health signal |
-| `cce.sla.steps.on-time-unsettled` | gauge | completed steps that beat their due date and have not been recorded `MET` yet — on-time work awaiting acknowledgement, not lateness |
-| `cce.sla.transitions.applied` | counter | `sla_status` writes that advanced a step — a transition row's breach, or the on-time sweep's `MET` |
-| `cce.sla.transitions.consumed` | counter | rows closed without recording a deviation — the event beat the deadline, the step was an exempt optional miss, or the SLA had already advanced |
+| `cce.sla.transitions.applied` | counter | `sla_status` writes that advanced a step — a breach, or a completion confirmed `MET` |
+| `cce.sla.transitions.skipped` | counter | rows that asked for a verdict and got none — an optional step's schedule predating the mandatory-only rule, or a step already settled. An anomaly signal, so it sits near zero; a deadline row consumed for the ordinary reason (the work beat its threshold) is not counted |
 | `cce.sla.evaluator.cycles` | counter | polling cycles run |
 | `cce.sla.evaluator.batches.failed` | counter | batches that rolled back and were backed off |
 
-The gauge counts only what is **ready to process** — it carries `fetchDueTransitions`'s own predicate,
+The gauge counts only what is **ready to process** — it carries `fetchTransitions`'s own predicate,
 so it reports what the next cycle will actually take. A gauge over every unprocessed row would fold in
 the entire future schedule, so it would track enrolment volume rather than lateness and could never sit
 near zero.
@@ -429,15 +424,67 @@ A burst of clinical events cannot delay the SLA sweep, and a large SLA backlog c
 processing.
 
 Replicas are safe to add freely: the fetch-and-apply cycle needs no coordination, and adding an instance
-adds throughput directly. The limiting factor is database contention on
-`step_sla_state_transition`, not anything in the application.
+adds throughput directly. The limiting factor is database contention on `step_sla_state_transition` and,
+since the fetch now joins it, `step_instance` — not anything in the application.
 
-`cce.sla.batch-size` trades transaction length against round trips. A larger batch holds row locks
-longer, which matters only if the Matcher Service is inserting into the same table heavily at the same
-time.
+`cce.sla.batch-size` trades transaction length against round trips, and now also against how long a
+batch's steps are held from Matcher: the fetch locks every step tied to a row in the batch for the whole
+transaction, not just the instant `sla_status` is written, so a larger batch means both a longer hold and
+more steps held.
+
+`SlaTransitionApplier.MAX_BATCH_SIZE` caps this at 100, enforced by refusing to start above it. Measured
+end to end on a 20-million-row `step_instance` table, batches of 250–350 rows reliably finished under the
+5-second poll interval; 450–550 straddled it with real run-to-run variance (450 rows ranged 4.5–9.7
+seconds across repeated runs, depending on whether that run's steps happened to be cache-resident); 550
+and above was over 5 seconds more often than not. The fetch itself stays in single-digit milliseconds
+regardless of table size — the cost is the apply loop, a single Hibernate session accumulating dirty
+state across the whole batch, which is why it does not scale smoothly with batch size. 100 sits well
+below where this starts, with margin for the variance observed. Raising it without re-measuring on
+production-scale hardware risks holding `step_instance` locks, and blocking Matcher's writes to those
+steps, for several seconds per batch.
+
+### Connections
+
+Each replica needs one connection to do its work: a single scheduler thread runs one batch at a time,
+and `backOff` only runs after a failed batch has rolled back and released its connection. The pool
+(`DB_POOL_SIZE`, default 3, minimum idle 1) leaves room for the two things that can overlap a batch — a
+Prometheus scrape running the `cce.sla.transitions.due` count, and the actuator health check. Adding
+replicas adds connections at that rate, so size the database's connection limit as replicas × pool size.
+
+### Write batching
+
+Every write a batch makes is sent with JDBC batching (`hibernate.jdbc.batch_size: 25`, with
+`order_updates` and `order_inserts`, the same values as Matcher):
+
+| Write | How it stays batchable |
+|---|---|
+| `step_sla_state_transition` UPDATE (attempts, processed), one per row | dirty-checked, flushed together |
+| `step_instance` UPDATE (`sla_status`), one per verdict | dirty-checked, flushed together |
+| `step_instance_history` INSERT, one per verdict | ids drawn 50 at a time from `step_instance_history_id_seq` (pooled optimizer), so no insert has to run early to read its key back |
+| `deviation` INSERT, one per breach | the applier collects the batch's breaches and hands them to `DeviationRecorder.recordDeviations` once, after the loop, which queues them all together with no query in between |
+
+Checked against Postgres 16 with 30 breaches in one batch: each of the four writes went out as two JDBC
+batches (25 + 5), with one deviation lookup and two `nextval` calls, where it used to be roughly 90
+single-statement round trips.
+
+Two things this depends on:
+
+- **The history sequences must step by 50.** Matcher's `V6` migration sets this. Hibernate compares a
+  sequence's increment with the entity's allocation size at startup and refuses to start if they differ,
+  so any service on the new `cce-common-util` (Matcher, this service, Protocol, Compliance) must start
+  after `V6` has run — deploy Matcher first, as for every schema change. History ids then stop arriving
+  in insert order across writers; nothing orders by them (reconstruction uses `changed_at`).
+- **Deviations are recorded at the end of the batch, not as each breach is found.** Nothing in the loop
+  reads a deviation back, and it is the same transaction, so no verdict changes. The
+  `deviation_step_type_key` unique constraint is still the backstop against a concurrent insert.
+
+The measurements behind `MAX_BATCH_SIZE` above were taken before batching; the apply loop they found
+dominant should now be cheaper. **Follow-up:** re-measure the fetch-and-apply path on the
+20-million-row dataset and revisit `MAX_BATCH_SIZE` from the new numbers.
 
 ## 8. Security
 
-No authentication at the application layer; the read API is expected to sit behind the gateway
-service. The service performs no writes on behalf of a caller — every write it makes is driven by the
-scheduler, from rows another service created.
+No authentication at the application layer, and no application API: the only HTTP surface is
+actuator's health and metrics endpoints, which should not be exposed beyond the cluster. The service
+performs no writes on behalf of a caller — every write it makes is driven by the scheduler, from rows
+another service created.
