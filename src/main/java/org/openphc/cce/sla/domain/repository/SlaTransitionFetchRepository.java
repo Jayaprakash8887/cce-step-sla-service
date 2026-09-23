@@ -2,7 +2,6 @@ package org.openphc.cce.sla.domain.repository;
 
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
-import org.openphc.cce.common.entity.StepInstance;
 import org.openphc.cce.common.entity.StepSlaStateTransition;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -25,8 +24,8 @@ import java.util.UUID;
  * somewhere the Matcher Service could reach for it.
  *
  * <p>{@code next_attempt_at} passing is what makes a row eligible; {@code process_by} is joined in as a
- * redundant, index-friendly bound (see {@link #fetchTransitions}) and to bring {@code step_instance}
- * into the same lock.
+ * redundant, index-friendly bound (see {@link #fetchTransitions}), and {@code step_instance} is fetched
+ * with each row, which also brings it into the same lock.
  */
 @Repository
 public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaStateTransition, UUID> {
@@ -44,13 +43,19 @@ public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaState
      * A step has up to three transition rows (its two thresholds and its {@code MET_CONDITION_REACHED}),
      * and {@code FOR UPDATE SKIP LOCKED} on {@code t} alone only protects a single row at a time — two
      * replicas can each claim a different row of the <em>same</em> step and both judge it concurrently,
-     * racing on {@code step_instance.sla_status}. Joining {@code StepInstance} into this query, with no
-     * {@code JOIN FETCH} and no columns of {@code s} selected, brings it under the same
-     * {@code PESSIMISTIC_WRITE} lock: Hibernate emits {@code ... join step_instance ... for no key update
-     * skip locked}, so a row is skipped if either its own row or its step is already held. A step can
-     * therefore only ever be claimed by one replica at a time, for as long as that replica's transaction
-     * runs — see {@link org.openphc.cce.sla.service.SlaTransitionApplier}'s {@code MAX_BATCH_SIZE} for
-     * why {@code cce.sla.batch-size} is capped, which bounds how long that hold can last.
+     * racing on {@code step_instance.sla_status}. Fetching {@code StepInstance} in this query brings it
+     * under the same {@code PESSIMISTIC_WRITE} lock: Hibernate emits {@code ... join step_instance ...
+     * for no key update skip locked}, with no {@code OF} list, so a row is skipped if either its own row
+     * or its step is already held. A step can therefore only ever be claimed by one replica at a time,
+     * for as long as that replica's transaction runs — see
+     * {@link org.openphc.cce.sla.service.SlaTransitionApplier}'s {@code MAX_BATCH_SIZE} for why
+     * {@code cce.sla.batch-size} is capped, which bounds how long that hold can last.
+     *
+     * <p>The fetch also hands the applier every step it judges, so a batch costs one query however large
+     * it grows, and a step's rows in the same batch all see the one managed instance — a verdict the
+     * first writes is visible to the rest. The join must keep {@code FETCH} (or otherwise select from
+     * {@code s}): a bare {@code JOIN t.stepInstance s} is pruned from the SQL, since the association is
+     * non-null and nothing of {@code s} is used, and the step's lock goes with it.
      *
      * <p>Selects on {@code next_attempt_at}, equal to {@code process_by} initially and pushed out by a
      * failure so a retry is deferred without rewriting {@code process_by} — which stays the immutable
@@ -79,7 +84,7 @@ public interface SlaTransitionFetchRepository extends JpaRepository<StepSlaState
     @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
     @Query("""
             SELECT t FROM StepSlaStateTransition t
-            JOIN StepInstance s ON s.id = t.stepInstanceId
+            JOIN FETCH t.stepInstance s
             WHERE t.processed = false
               AND t.nextAttemptAt <= :now
               AND t.processBy <= :now

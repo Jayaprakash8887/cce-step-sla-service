@@ -24,10 +24,7 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 /**
  * Fetches due {@code step_sla_state_transition} rows and applies them.
@@ -209,56 +206,22 @@ public class SlaTransitionApplier {
     public int fetchAndApply(List<UUID> fetched) {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         List<StepSlaStateTransition> dueRows = transitionRepository.fetchTransitions(now, Limit.of(batchSize));
-        Map<UUID, StepInstance> stepsById = loadStepsFor(dueRows);
 
         for (StepSlaStateTransition row : dueRows) {
             fetched.add(row.getId());
             row.setAttempts(row.getAttempts() + 1);
             if (row.getAttempts() > ATTEMPTS_BEFORE_ALERT) {
                 log.error("SLA transition {} for step {} has now been attempted {} times",
-                        row.getId(), row.getStepInstanceId(), row.getAttempts());
+                        row.getId(), row.getStepInstance().getId(), row.getAttempts());
             }
-            applyRow(row, stepsById.get(row.getStepInstanceId()));
+            applyRow(row);
         }
         return dueRows.size();
     }
 
-    /**
-     * Every step the batch judges, in one query.
-     *
-     * <p>Fetching each row's step as the row is applied would be a query per row — a hundred round
-     * trips for a hundred-row batch, all inside the transaction holding the row locks. One
-     * {@code IN (…)} instead, before the loop, so the cost of a batch is two queries however large
-     * {@code batch-size} grows.
-     *
-     * <p>Ids are de-duplicated because a step can have up to three rows — its two thresholds and its
-     * {@code MET_CONDITION_REACHED} — and they can come round in the same batch. They then all see the
-     * same managed instance, so a verdict written by the first is visible to the rest.
-     */
-    private Map<UUID, StepInstance> loadStepsFor(List<StepSlaStateTransition> rows) {
-        if (rows.isEmpty()) {
-            return Map.of();
-        }
-        List<UUID> stepIds = rows.stream()
-                .map(StepSlaStateTransition::getStepInstanceId)
-                .distinct()
-                .toList();
-        return stepInstanceRepository.findAllById(stepIds).stream()
-                .collect(Collectors.toMap(StepInstance::getId, Function.identity()));
-    }
-
-    private void applyRow(StepSlaStateTransition row, StepInstance step) {
-        if (step == null) {
-            // Unreachable while the schema holds: step_instance_id is NOT NULL and carries a foreign key
-            // to step_instance(id), with no cascade, so the database refuses to leave a row without its
-            // step. Kept because the alternative to a guard here is a NullPointerException on every
-            // cycle: a row whose step is somehow gone can never succeed, so consume it rather than
-            // retry it forever.
-            log.warn("SLA transition {} references step {} which no longer exists — consuming",
-                    row.getId(), row.getStepInstanceId());
-            markProcessed(row);
-            return;
-        }
+    private void applyRow(StepSlaStateTransition row) {
+        // Already loaded and locked by the fetch, which joins each row's step in.
+        StepInstance step = row.getStepInstance();
 
         if (!RequiredBehavior.isMandatory(step.getRequiredBehavior())) {
             // Nothing was required of an optional step, so it has no deadline to breach and none to

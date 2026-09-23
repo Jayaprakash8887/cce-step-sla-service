@@ -157,20 +157,23 @@ stays the immutable record of when the deadline fell. The `process_by <= now` bo
 `process_by`, a Matcher migration) it lets Postgres walk that index in `ORDER BY` order and stop after
 one batch, instead of reading and sorting the whole due backlog to return the top `batchSize`.
 
-**The fetch also joins `step_instance`, under the same lock.** A step has up to three transition rows
+**The fetch also fetches `step_instance`, under the same lock.** A step has up to three transition rows
 (its two thresholds and its `MET_CONDITION_REACHED`), and locking `step_sla_state_transition` rows alone
 only protects one row at a time — two replicas could each claim a different row of the *same* step and
-judge it concurrently, racing on `step_instance.sla_status`. The join brings `step_instance` under the
-same `FOR UPDATE`/`SKIP LOCKED` semantics (Hibernate emits `... join step_instance ... for no key update
-skip locked`), with no columns of it selected and no change to what the row's eligibility means: a step
-is now held by exactly one replica for as long as that replica's batch transaction runs. `MAX_BATCH_SIZE`
-(§7) bounds how long that hold can last.
+judge it concurrently, racing on `step_instance.sla_status`. `JOIN FETCH t.stepInstance` brings
+`step_instance` under the same `FOR UPDATE`/`SKIP LOCKED` semantics (Hibernate emits `... join
+step_instance ... for no key update skip locked`, with no `OF` list), with no change to what the row's
+eligibility means: a step is now held by exactly one replica for as long as that replica's batch
+transaction runs. `MAX_BATCH_SIZE` (§7) bounds how long that hold can last. The same query hands the
+applier every step it judges, so a batch is one query however large it grows, and a step's rows in one
+batch share a single managed instance. It has to stay a *fetch* join: a bare `JOIN t.stepInstance`
+selects nothing from the step and is pruned from the SQL, taking the step's lock with it.
 
 **any rows fetched?** — zero is the steady state: one empty indexed query per interval, and the cycle
 ends.
 
 **apply each row** — per row: increment `attempts` (past five, the row is logged as an error every cycle
-rather than failing quietly), load the step, decide whether the threshold was breached, write
+rather than failing quietly), take the step the fetch brought with it, decide whether the threshold was breached, write
 `sla_status` forward-only, record the deviation if there is one, mirror the write into
 `step_instance_history`, and mark the row processed with `processed_by`. §4 covers the judgement itself.
 Each fetched id is also appended to a list the evaluator holds — plain memory rather than transactional
@@ -297,7 +300,6 @@ writes both from one value in one transaction — but they answer to different o
 | `MET_CONDITION_REACHED` | `completed_at < due_date` | `MET` | — |
 | `MET_CONDITION_REACHED` | anything else | *unchanged* | — |
 
-A step whose row no longer exists is consumed rather than retried: there is no schedule left to honour.
 A step marked `COMPLETED` with no `completed_at` is treated as a breach — the row is better evidence
 than a missing timestamp, and letting it pass would hide the gap instead of surfacing it. That rule
 needs no clock to justify it: a row is only ever applied once its own threshold has passed, so a step
