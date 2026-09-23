@@ -44,6 +44,7 @@ production:
 |---|---|---|
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | |
 | `DB_USERNAME` / `DB_PASSWORD` | `cce_user` / `cce_pass` | never leave at the default |
+| `DB_POOL_SIZE` | `3` | per replica; size the database's connection limit as replicas × this |
 | `CCE_SLA_INSTANCE_ID` | `$HOSTNAME` | **set this per replica** — it lands in `processed_by` |
 | `CCE_SLA_POLL_INTERVAL_MS` | `5000` | |
 | `CCE_SLA_BATCH_SIZE` | `100` | |

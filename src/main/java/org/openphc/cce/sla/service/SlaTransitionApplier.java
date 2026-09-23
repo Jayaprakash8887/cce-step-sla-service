@@ -10,6 +10,7 @@ import org.openphc.cce.common.enums.StepStatus;
 import org.openphc.cce.common.repository.StepInstanceRepository;
 import org.openphc.cce.common.support.RequiredBehavior;
 import org.openphc.cce.common.deviation.DeviationRecorder;
+import org.openphc.cce.common.deviation.DeviationRecorder.PendingDeviation;
 import org.openphc.cce.common.history.StateTransitionHistoryWriter;
 import org.openphc.cce.sla.domain.repository.SlaTransitionFetchRepository;
 import org.slf4j.Logger;
@@ -23,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -198,30 +200,38 @@ public class SlaTransitionApplier {
      * {@code required_behavior} from the step. So <em>when</em> a row is applied cannot change what it
      * decides.
      *
-     * @param fetched populated with the id of every row fetched, so the caller can back them off if the
+     * <p>The batch's deviations are recorded together once every row has been judged, rather than one
+     * per breach as it is found: one existence check for the batch instead of one per deviation, which
+     * lets the inserts go out as a single JDBC batch at commit (see
+     * {@link DeviationRecorder#recordDeviations}). Nothing in the loop reads a deviation back, so
+     * deferring them to the end of the same transaction changes no verdict.
+     *
+     * @param fetchedIds populated with the id of every row fetched, so the caller can back them off if the
      *                transaction rolls back — the list is plain memory and survives the rollback
      * @return how many rows were fetched
      */
     @Transactional
-    public int fetchAndApply(List<UUID> fetched) {
+    public int fetchAndApply(List<UUID> fetchedIds) {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-        List<StepSlaStateTransition> dueRows = transitionRepository.fetchTransitions(now, Limit.of(batchSize));
+        List<StepSlaStateTransition> dueTransitions = transitionRepository.fetchTransitions(now, Limit.of(batchSize));
+        List<PendingDeviation> breaches = new ArrayList<>();
 
-        for (StepSlaStateTransition row : dueRows) {
-            fetched.add(row.getId());
-            row.setAttempts(row.getAttempts() + 1);
-            if (row.getAttempts() > ATTEMPTS_BEFORE_ALERT) {
+        for (StepSlaStateTransition transition : dueTransitions) {
+            fetchedIds.add(transition.getId());
+            transition.setAttempts(transition.getAttempts() + 1);
+            if (transition.getAttempts() > ATTEMPTS_BEFORE_ALERT) {
                 log.error("SLA transition {} for step {} has now been attempted {} times",
-                        row.getId(), row.getStepInstance().getId(), row.getAttempts());
+                        transition.getId(), transition.getStepInstance().getId(), transition.getAttempts());
             }
-            applyRow(row);
+            applyTransition(transition, breaches);
         }
-        return dueRows.size();
+        deviationRecorder.recordDeviations(breaches);
+        return dueTransitions.size();
     }
 
-    private void applyRow(StepSlaStateTransition row) {
+    private void applyTransition(StepSlaStateTransition transition, List<PendingDeviation> breaches) {
         // Already loaded and locked by the fetch, which joins each row's step in.
-        StepInstance step = row.getStepInstance();
+        StepInstance step = transition.getStepInstance();
 
         if (!RequiredBehavior.isMandatory(step.getRequiredBehavior())) {
             // Nothing was required of an optional step, so it has no deadline to breach and none to
@@ -231,20 +241,20 @@ public class SlaTransitionApplier {
             skippedCounter.increment();
             log.warn("Step {} is optional (requiredBehavior={}) — {} transition {} is a stale schedule "
                             + "and records no status or deviation",
-                    step.getId(), step.getRequiredBehavior(), row.getTransitionType(), row.getId());
-            markProcessed(row);
+                    step.getId(), step.getRequiredBehavior(), transition.getTransitionType(), transition.getId());
+            markProcessed(transition);
             return;
         }
 
-        if (row.getTransitionType() == SlaTransitionType.MET_CONDITION_REACHED) {
-            applyOnTime(row, step);
-        } else if (breachedThreshold(row, step)) {
-            applyBreach(row, step);
+        if (transition.getTransitionType() == SlaTransitionType.MET_CONDITION_REACHED) {
+            applyOnTime(transition, step);
+        } else if (breachedThreshold(transition, step)) {
+            applyBreach(transition, step, breaches);
         }
         // A deadline that was kept records nothing: the step's own MET row carries that verdict, and
         // beating the missed date says only that the step was not written off. Such a row falls
         // straight through to being marked processed.
-        markProcessed(row);
+        markProcessed(transition);
     }
 
     /**
@@ -255,12 +265,12 @@ public class SlaTransitionApplier {
      * with no {@code completed_at} is treated as a breach — the row is the better evidence than a
      * missing timestamp, and silently letting it pass would hide the gap.
      */
-    private boolean breachedThreshold(StepSlaStateTransition row, StepInstance step) {
+    private boolean breachedThreshold(StepSlaStateTransition transition, StepInstance step) {
         if (step.getStepStatus() != StepStatus.COMPLETED) {
             return true;
         }
         OffsetDateTime completedAt = step.getCompletedAt();
-        return completedAt == null || !completedAt.isBefore(row.getProcessBy());
+        return completedAt == null || !completedAt.isBefore(transition.getProcessBy());
     }
 
     /**
@@ -273,13 +283,13 @@ public class SlaTransitionApplier {
      *
      * <p>No deviation: there is nothing deviant about work done on time.
      */
-    private void applyOnTime(StepSlaStateTransition row, StepInstance step) {
+    private void applyOnTime(StepSlaStateTransition transition, StepInstance step) {
         if (!beatItsDueDate(step)) {
             skippedCounter.increment();
             log.warn("Step {} no longer reads as on time (stepStatus={}, completedAt={}, dueDate={}) — "
                             + "transition {} records nothing",
                     step.getId(), step.getStepStatus(), step.getCompletedAt(), step.getDueDate(),
-                    row.getId());
+                    transition.getId());
             return;
         }
 
@@ -301,15 +311,16 @@ public class SlaTransitionApplier {
                 && step.getCompletedAt().isBefore(step.getDueDate());
     }
 
-    /** The deadline was not met: advance the SLA and record the deviation. */
-    private void applyBreach(StepSlaStateTransition row, StepInstance step) {
-        if (!writeSlaStatus(step, row.getTransitionType().breachStatus())) {
+    /** The deadline was not met: advance the SLA, and queue the deviation for the end of the batch. */
+    private void applyBreach(StepSlaStateTransition transition, StepInstance step,
+                             List<PendingDeviation> breaches) {
+        if (!writeSlaStatus(step, transition.getTransitionType().breachStatus())) {
             // Already at or past this outcome: a re-fetched row, or rows applied out of order.
             skippedCounter.increment();
             return;
         }
 
-        raiseDeviationFor(row, step);
+        breaches.add(deviationFor(transition, step));
     }
 
     /**
@@ -352,15 +363,15 @@ public class SlaTransitionApplier {
      * {@link DeviationRecorder} de-duplicates on the step and type, so a re-fetched row cannot record
      * the same deviation twice.
      */
-    private void raiseDeviationFor(StepSlaStateTransition row, StepInstance step) {
-        deviationRecorder.recordDeviation(step, row.getTransitionType().breachDeviation());
+    private PendingDeviation deviationFor(StepSlaStateTransition transition, StepInstance step) {
+        return new PendingDeviation(step, transition.getTransitionType().breachDeviation());
     }
 
-    private void markProcessed(StepSlaStateTransition row) {
-        row.setProcessed(true);
-        row.setProcessedAt(OffsetDateTime.now(ZoneOffset.UTC));
-        row.setProcessedBy(instanceId);
-        transitionRepository.save(row);
+    private void markProcessed(StepSlaStateTransition transition) {
+        transition.setProcessed(true);
+        transition.setProcessedAt(OffsetDateTime.now(ZoneOffset.UTC));
+        transition.setProcessedBy(instanceId);
+        transitionRepository.save(transition);
     }
 
     /**
@@ -370,17 +381,17 @@ public class SlaTransitionApplier {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void backOff(List<UUID> transitionIds) {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-        for (StepSlaStateTransition row : transitionRepository.findAllById(transitionIds)) {
-            if (row.isProcessed()) {
+        for (StepSlaStateTransition transition : transitionRepository.findAllById(transitionIds)) {
+            if (transition.isProcessed()) {
                 continue;
             }
             // Exponential in the attempt count, capped so a permanently broken row is still retried
             // occasionally rather than hammering the database.
             long seconds = Math.min(maxBackoff.getSeconds(),
-                    (long) Math.pow(2, Math.min(row.getAttempts(), 20)));
-            row.setAttempts(row.getAttempts() + 1);
-            row.setNextAttemptAt(now.plusSeconds(seconds));
-            transitionRepository.save(row);
+                    (long) Math.pow(2, Math.min(transition.getAttempts(), 20)));
+            transition.setAttempts(transition.getAttempts() + 1);
+            transition.setNextAttemptAt(now.plusSeconds(seconds));
+            transitionRepository.save(transition);
         }
     }
 }

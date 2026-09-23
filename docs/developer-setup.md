@@ -38,6 +38,7 @@ curl -s localhost:8092/actuator/health
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | `5433` for the collector's shared instance |
 | `DB_NAME` | `ccedb` | |
 | `DB_USERNAME` / `DB_PASSWORD` | `cce_user` / `cce_pass` | needs **no** DDL rights |
+| `DB_POOL_SIZE` / `DB_POOL_MIN_IDLE` | `3` / `1` | one connection does the work; see [Architecture §7](architecture-overview.md#7-scaling) |
 | `CCE_SLA_POLL_INTERVAL_MS` | `5000` | how often to look for due transitions |
 | `CCE_SLA_BATCH_SIZE` | `100` | rows fetched per transaction |
 | `CCE_SLA_INSTANCE_ID` | `$HOSTNAME` | recorded in `processed_by` |

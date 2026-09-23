@@ -56,9 +56,9 @@ public class SlaTransitionEvaluator {
     @Scheduled(fixedDelayString = "${cce.sla.poll-interval-ms:5000}")
     public void poll() {
         try {
-            int applied = evaluateDue();
-            if (applied > 0) {
-                log.info("SLA evaluation cycle applied {} transition(s)", applied);
+            int fetchedThisCycle = evaluateDue();
+            if (fetchedThisCycle > 0) {
+                log.info("SLA evaluation cycle processed {} transition(s)", fetchedThisCycle);
             }
         } catch (RuntimeException e) {
             // Never let a cycle's failure kill the scheduler thread.
@@ -73,34 +73,34 @@ public class SlaTransitionEvaluator {
      */
     public int evaluateDue() {
         cycleCounter.increment();
-        int total = 0;
+        int fetchedThisCycle = 0;
 
-        for (int batch = 0; batch < MAX_BATCHES_PER_CYCLE; batch++) {
-            List<UUID> fetched = new ArrayList<>();
-            int count;
+        for (int batchIndex = 0; batchIndex < MAX_BATCHES_PER_CYCLE; batchIndex++) {
+            List<UUID> fetchedIds = new ArrayList<>();
+            int fetchedInBatch;
             try {
-                count = applier.fetchAndApply(fetched);
+                fetchedInBatch = applier.fetchAndApply(fetchedIds);
             } catch (RuntimeException e) {
                 // The batch rolled back, so nothing was marked processed and no deviation was written.
                 // Back the fetched rows off in a fresh transaction so they are retried later rather than
                 // on every cycle, then stop: whatever broke is likely to break the next batch too.
                 failedBatchCounter.increment();
                 log.error("SLA batch of {} row(s) failed and was rolled back — backing off",
-                        fetched.size(), e);
-                if (!fetched.isEmpty()) {
-                    applier.backOff(fetched);
+                        fetchedIds.size(), e);
+                if (!fetchedIds.isEmpty()) {
+                    applier.backOff(fetchedIds);
                 }
-                return total;
+                return fetchedThisCycle;
             }
 
-            total += count;
-            if (count < batchSize) {
-                return total;
+            fetchedThisCycle += fetchedInBatch;
+            if (fetchedInBatch < batchSize) {
+                return fetchedThisCycle;
             }
         }
 
         log.warn("SLA evaluation stopped at the {}-batch cycle limit — backlog may still be draining",
                 MAX_BATCHES_PER_CYCLE);
-        return total;
+        return fetchedThisCycle;
     }
 }

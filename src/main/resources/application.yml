@@ -16,9 +16,13 @@ spring:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:ccedb}
     username: ${DB_USERNAME:cce_user}
     password: ${DB_PASSWORD:cce_pass}
+    # One scheduler thread does all the work, one batch at a time (backOff runs after the failed batch
+    # has released its connection), so steady state is a single connection. The other two cover what
+    # can overlap a batch: a Prometheus scrape running the due-transitions gauge query, and the actuator
+    # health check. Raise this only if the service gains another concurrent database user.
     hikari:
-      maximum-pool-size: ${DB_POOL_SIZE:20}
-      minimum-idle: ${DB_POOL_MIN_IDLE:5}
+      maximum-pool-size: ${DB_POOL_SIZE:3}
+      minimum-idle: ${DB_POOL_MIN_IDLE:1}
       connection-timeout: ${DB_CONNECTION_TIMEOUT:30000}
       idle-timeout: ${DB_IDLE_TIMEOUT:600000}
       max-lifetime: ${DB_MAX_LIFETIME:1800000}
@@ -30,8 +34,15 @@ spring:
     open-in-view: false
     properties:
       hibernate:
+        # Sends a batch's writes (transition and step UPDATEs, history and deviation INSERTs) as JDBC
+        # batches rather than one round trip each. Same values as the Matcher Service. History ids come
+        # from a sequence in blocks of 50 and deviations are recorded once per batch, which is what keeps
+        # the inserts batchable — see docs/architecture-overview.md §7.
         jdbc:
           time_zone: UTC
+          batch_size: 25
+        order_inserts: true
+        order_updates: true
 
   # --- Flyway ---
   # This service owns no tables. The Matcher Service's migration creates step_instance,

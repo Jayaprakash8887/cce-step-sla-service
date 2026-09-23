@@ -43,17 +43,17 @@ class SlaTransitionEvaluatorTest {
     void failedBatch_backsOffTheRowsItHadFetched() {
         // The batch rolled back, so nothing was marked processed. The ids it collected before failing
         // are still in the caller's list, which is what lets them be deferred.
-        UUID a = UUID.randomUUID();
-        UUID b = UUID.randomUUID();
-        doAnswer(inv -> {
-            List<UUID> fetched = inv.getArgument(0);
-            fetched.add(a);
-            fetched.add(b);
+        UUID firstTransitionId = UUID.randomUUID();
+        UUID secondTransitionId = UUID.randomUUID();
+        doAnswer(invocation -> {
+            List<UUID> fetchedIds = invocation.getArgument(0);
+            fetchedIds.add(firstTransitionId);
+            fetchedIds.add(secondTransitionId);
             throw new IllegalStateException("boom");
         }).when(applier).fetchAndApply(any());
 
         assertEquals(0, evaluator(10).evaluateDue());
-        verify(applier).backOff(List.of(a, b));
+        verify(applier).backOff(List.of(firstTransitionId, secondTransitionId));
     }
 
     @Test

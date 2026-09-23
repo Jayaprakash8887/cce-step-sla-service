@@ -442,6 +442,45 @@ below where this starts, with margin for the variance observed. Raising it witho
 production-scale hardware risks holding `step_instance` locks, and blocking Matcher's writes to those
 steps, for several seconds per batch.
 
+### Connections
+
+Each replica needs one connection to do its work: a single scheduler thread runs one batch at a time,
+and `backOff` only runs after a failed batch has rolled back and released its connection. The pool
+(`DB_POOL_SIZE`, default 3, minimum idle 1) leaves room for the two things that can overlap a batch — a
+Prometheus scrape running the `cce.sla.transitions.due` count, and the actuator health check. Adding
+replicas adds connections at that rate, so size the database's connection limit as replicas × pool size.
+
+### Write batching
+
+Every write a batch makes is sent with JDBC batching (`hibernate.jdbc.batch_size: 25`, with
+`order_updates` and `order_inserts`, the same values as Matcher):
+
+| Write | How it stays batchable |
+|---|---|
+| `step_sla_state_transition` UPDATE (attempts, processed), one per row | dirty-checked, flushed together |
+| `step_instance` UPDATE (`sla_status`), one per verdict | dirty-checked, flushed together |
+| `step_instance_history` INSERT, one per verdict | ids drawn 50 at a time from `step_instance_history_id_seq` (pooled optimizer), so no insert has to run early to read its key back |
+| `deviation` INSERT, one per breach | the applier collects the batch's breaches and hands them to `DeviationRecorder.recordDeviations` once, after the loop: one existence query for the whole batch, then all new rows queued together |
+
+Checked against Postgres 16 with 30 breaches in one batch: each of the four writes went out as two JDBC
+batches (25 + 5), with one deviation lookup and two `nextval` calls, where it used to be roughly 90
+single-statement round trips.
+
+Two things this depends on:
+
+- **The history sequences must step by 50.** Matcher's `V6` migration sets this. Hibernate compares a
+  sequence's increment with the entity's allocation size at startup and refuses to start if they differ,
+  so any service on the new `cce-common-util` (Matcher, this service, Protocol, Compliance) must start
+  after `V6` has run — deploy Matcher first, as for every schema change. History ids then stop arriving
+  in insert order across writers; nothing orders by them (reconstruction uses `changed_at`).
+- **Deviations are recorded at the end of the batch, not as each breach is found.** Nothing in the loop
+  reads a deviation back, and it is the same transaction, so no verdict changes. The
+  `deviation_step_type_key` unique constraint is still the backstop against a concurrent insert.
+
+The measurements behind `MAX_BATCH_SIZE` above were taken before batching; the apply loop they found
+dominant should now be cheaper. **Follow-up:** re-measure the fetch-and-apply path on the
+20-million-row dataset and revisit `MAX_BATCH_SIZE` from the new numbers.
+
 ## 8. Security
 
 No authentication at the application layer, and no application API: the only HTTP surface is
