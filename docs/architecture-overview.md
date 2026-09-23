@@ -46,7 +46,8 @@ During an Event Replay the two do not merely race occasionally; they collide by 
      `OVERDUE` can never become `MET`.
    - The `MET_CONDITION_REACHED` row Matcher writes when it finally reaches the event is applied
      against a step that is no longer null, so it records nothing.
-   - The deviation row already exists and is de-duplicated, so it is not reconsidered.
+   - The deviation row stays: nothing withdraws it, and the step's status cannot be written again to
+     raise it a second time.
 
 What makes this a prerequisite rather than a preference is that nothing notices. A wrong verdict is not
 an error the service reports — it is an ordinary-looking `sla_status` and deviation, and undoing it is
@@ -460,7 +461,7 @@ Every write a batch makes is sent with JDBC batching (`hibernate.jdbc.batch_size
 | `step_sla_state_transition` UPDATE (attempts, processed), one per row | dirty-checked, flushed together |
 | `step_instance` UPDATE (`sla_status`), one per verdict | dirty-checked, flushed together |
 | `step_instance_history` INSERT, one per verdict | ids drawn 50 at a time from `step_instance_history_id_seq` (pooled optimizer), so no insert has to run early to read its key back |
-| `deviation` INSERT, one per breach | the applier collects the batch's breaches and hands them to `DeviationRecorder.recordDeviations` once, after the loop: one existence query for the whole batch, then all new rows queued together |
+| `deviation` INSERT, one per breach | the applier collects the batch's breaches and hands them to `DeviationRecorder.recordDeviations` once, after the loop, which queues them all together with no query in between |
 
 Checked against Postgres 16 with 30 breaches in one batch: each of the four writes went out as two JDBC
 batches (25 + 5), with one deviation lookup and two `nextval` calls, where it used to be roughly 90

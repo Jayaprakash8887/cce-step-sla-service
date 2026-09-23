@@ -201,8 +201,7 @@ public class SlaTransitionApplier {
      * decides.
      *
      * <p>The batch's deviations are recorded together once every row has been judged, rather than one
-     * per breach as it is found: one existence check for the batch instead of one per deviation, which
-     * lets the inserts go out as a single JDBC batch at commit (see
+     * per breach as it is found, so the inserts go out as a single JDBC batch at commit (see
      * {@link DeviationRecorder#recordDeviations}). Nothing in the loop reads a deviation back, so
      * deferring them to the end of the same transaction changes no verdict.
      *
@@ -360,8 +359,9 @@ public class SlaTransitionApplier {
     /**
      * The deviation a breach produces — the due date an {@code OVERDUE}, the missed date a
      * {@code MISSED} — read off the row's own type, which is where that mapping is declared.
-     * {@link DeviationRecorder} de-duplicates on the step and type, so a re-fetched row cannot record
-     * the same deviation twice.
+     * Only reached when {@link #writeSlaStatus} has just written the breach status, which
+     * {@code SlaStatus.canReplace} allows once per step, so a re-fetched row cannot record the same
+     * deviation twice.
      */
     private PendingDeviation deviationFor(StepSlaStateTransition transition, StepInstance step) {
         return new PendingDeviation(step, transition.getTransitionType().breachDeviation());
