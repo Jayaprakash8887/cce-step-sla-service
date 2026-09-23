@@ -143,7 +143,7 @@ alone; the shared repositories are the read side another service could reach for
 
 ### Step by step
 
-**Scheduled poll** — a Spring `fixedDelay` timer, default 5s, is the only thing that starts work in this
+**Scheduled poll** — a Spring `fixedDelay` timer (5s by default, 15s under the `prod` profile; the delay runs from the end of one cycle to the start of the next) is the only thing that starts work in this
 service. `poll()` catches everything `evaluateDue()` throws, because an exception escaping a
 `@Scheduled` method stops the schedule. Every replica runs its own timer.
 

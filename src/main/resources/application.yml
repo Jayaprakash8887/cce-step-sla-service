@@ -57,7 +57,8 @@ cce:
   sla:
     # The evaluator fetches step_sla_state_transition rows with FOR UPDATE SKIP LOCKED, so every replica
     # can poll concurrently. This interval is the steady-state cost — one empty fetch query per tick; a
-    # backlog is drained within a single cycle rather than one batch per tick.
+    # backlog is drained within a single cycle rather than one batch per tick. 5s suits development;
+    # the prod profile (application-prod.yml) raises it to 15s.
     poll-interval-ms: ${CCE_SLA_POLL_INTERVAL_MS:5000}
     # The fetch locks every step tied to a row in the batch for the whole transaction (see
     # SlaTransitionFetchRepository), so a larger batch holds step_instance locks longer and blocks

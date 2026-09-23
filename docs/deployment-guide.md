@@ -46,7 +46,8 @@ production:
 | `DB_USERNAME` / `DB_PASSWORD` | `cce_user` / `cce_pass` | never leave at the default |
 | `DB_POOL_SIZE` | `3` | per replica; size the database's connection limit as replicas × this |
 | `CCE_SLA_INSTANCE_ID` | `$HOSTNAME` | **set this per replica** — it lands in `processed_by` |
-| `CCE_SLA_POLL_INTERVAL_MS` | `5000` | |
+| `SPRING_PROFILES_ACTIVE` | — | **set to `prod`** — raises the poll interval to 15s |
+| `CCE_SLA_POLL_INTERVAL_MS` | `5000`, `15000` under `prod` | overrides either |
 | `CCE_SLA_BATCH_SIZE` | `100` | |
 
 `CCE_SLA_INSTANCE_ID` defaults to `$HOSTNAME`, which is already distinct per pod in Kubernetes. Set it
@@ -96,6 +97,8 @@ spec:
           image: cce-step-sla-service:2.0.0
           ports: [{ containerPort: 8080 }]
           env:
+            - { name: SPRING_PROFILES_ACTIVE, value: prod }
+            - { name: SERVER_PORT, value: "8080" }
             - name: CCE_SLA_INSTANCE_ID
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: DB_HOST
@@ -210,6 +213,19 @@ replay this is the list to work from.
 | `/actuator/health/readiness` | Route traffic — fails while the database is unreachable |
 | `/actuator/health/liveness` | Restart decisions |
 | `/actuator/prometheus` | Scrape target |
+
+Scrape every 60s rather than the 15s global default. Each scrape evaluates the
+`cce.sla.transitions.due` gauge, which is one database query per replica (an index-only scan on
+`idx_sslt_due`, about 0.2 ms in steady state), and a backlog signal needs no finer resolution than
+that:
+
+```yaml
+- job_name: "cce-step-sla-service"
+  metrics_path: /actuator/prometheus
+  scrape_interval: 60s
+  static_configs:
+    - targets: ["cce-step-sla-service:8080"]
+```
 
 Note what readiness does **not** cover: the scheduler. A pod can report ready while its SLA sweep is
 stalled. The metric to alert on is `cce.sla.transitions.due` — see
